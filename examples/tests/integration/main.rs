@@ -13,6 +13,10 @@ mod utils;
 
 #[cfg(all(feature = "fastcgi", feature = "http-full"))]
 mod fastcgi_reverse_proxy;
+#[cfg(all(feature = "grpc", feature = "http-full"))]
+mod grpc_echo;
+#[cfg(all(feature = "grpc", feature = "http-full"))]
+mod grpc_json_echo;
 #[cfg(all(feature = "haproxy", feature = "http-full"))]
 mod haproxy_client_ip;
 #[cfg(feature = "http-full")]
@@ -23,12 +27,16 @@ mod http_advanced_router;
 mod http_anti_bot_infinite_resource;
 #[cfg(feature = "http-full")]
 mod http_anti_bot_zip_bomb;
+#[cfg(all(feature = "http-full", feature = "boring"))]
+mod http_blocking_https_client;
 #[cfg(feature = "http-full")]
 mod http_connect_proxy;
 #[cfg(feature = "http-full")]
 mod http_declarative_partial_updates;
 #[cfg(feature = "http-full")]
 mod http_form;
+#[cfg(all(feature = "grpc", feature = "http-full"))]
+mod http_grpc_job;
 #[cfg(feature = "http-full")]
 mod http_har_replay;
 #[cfg(feature = "http-full")]
@@ -42,6 +50,8 @@ mod http_high_level_client;
     feature = "boring",
 ))]
 mod http_https_socks5_and_socks5h_connect_proxy;
+#[cfg(all(feature = "http-full", feature = "icap", feature = "boring"))]
+mod http_icap_proxy;
 #[cfg(feature = "http-full")]
 mod http_k8s_health;
 #[cfg(feature = "http-full")]
@@ -98,6 +108,8 @@ mod http_sse;
 #[cfg(feature = "http-full")]
 mod http_sse_datastar_hello;
 #[cfg(feature = "http-full")]
+mod http_sse_datastar_svg;
+#[cfg(feature = "http-full")]
 mod http_sse_datastar_test_suite;
 #[cfg(feature = "http-full")]
 mod http_sse_json;
@@ -137,6 +149,8 @@ mod ttrpc_server;
 mod udp_codec;
 #[cfg(all(feature = "udp", feature = "tcp"))]
 mod udp_over_tcp;
+#[cfg(all(feature = "http-full", feature = "boring"))]
+mod ws_blocking_wss_client;
 #[cfg(feature = "http-full")]
 mod ws_chat_server;
 #[cfg(feature = "http-full")]

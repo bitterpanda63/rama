@@ -1,19 +1,23 @@
 set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
 
-# `--cfg tokio_unstable` enables Tokio's unstable runtime APIs that
-# `dial9-tokio-telemetry` requires. It is benign for crates that do
-# not opt into the `dial9` feature; the workspace `.cargo/config.toml`
-# carries the same flag for raw `cargo` invocations. We set it via env
-# here because justfile's `export RUSTFLAGS` overrides cargo's config.
-#
 # Set `ALLOW_WARNINGS=true` for local iteration to drop `-D warnings`
 # so in-progress code with unused imports / dead code still builds.
+#
+# Set `TOKIO_UNSTABLE=true` to add `--cfg tokio_unstable`, which widens
+# dial9's task coverage.
+
+# This is an `export` rather than a `.cargo/config.toml` entry because
+# justfile's `export RUSTFLAGS` overrides cargo's config either way.
 export RUSTFLAGS := \
-    if env_var_or_default("ALLOW_WARNINGS", "false") == "true" { \
-        "--cfg tokio_unstable" \
+    (if env_var_or_default("ALLOW_WARNINGS", "false") == "true" { \
+        "" \
     } else { \
-        "-D warnings --cfg tokio_unstable" \
-    }
+        "-D warnings" \
+    }) + (if env_var_or_default("TOKIO_UNSTABLE", "false") == "true" { \
+        " --cfg tokio_unstable" \
+    } else { \
+        "" \
+    })
 # Mirror CI's doc job: rustdoc warnings (e.g. private intra-doc links) fail
 # locally too, unless ALLOW_WARNINGS=true. rustdoc reads RUSTDOCFLAGS, not
 # RUSTFLAGS, so it needs its own export.
@@ -60,6 +64,65 @@ check-crate-linux CRATE:
   cargo check -p {{CRATE}} --target x86_64-unknown-linux-gnu --all-features
   cargo check -p {{CRATE}} --target aarch64-unknown-linux-gnu --all-features
 
+# Cross-link the same bounded Linux GNU coverage used by CI. The default
+# target keeps compatibility with glibc 2.17; pass another cargo-zigbuild
+# target explicitly when a different architecture or baseline is needed.
+test-zigbuild-linux-gnu TARGET="x86_64-unknown-linux-gnu.2.17":
+    just test-zigbuild-linux-gnu-sentinels {{TARGET}}
+    just test-zigbuild-linux-gnu-cli {{TARGET}}
+    just test-zigbuild-linux-gnu-all {{TARGET}}
+
+# Cross-link configurations where all-features could mask a target ABI issue
+# or activate several interchangeable backends at once.
+test-zigbuild-linux-gnu-sentinels TARGET="x86_64-unknown-linux-gnu.2.17":
+    @just _zigbuild-linux-gnu-with-native-env _zigbuild-linux-gnu-sentinels {{TARGET}}
+
+_zigbuild-linux-gnu-sentinels TARGET:
+    cargo zigbuild --locked -p rama --tests --no-default-features --target {{TARGET}}
+    just test-zigbuild-linux-gnu-native-dns {{TARGET}}
+    cargo zigbuild --locked -p rama --tests --no-default-features --features rustls,ring --target {{TARGET}}
+    cargo zigbuild --locked -p rama --tests --no-default-features --features rustls,aws-lc --target {{TARGET}}
+    cargo zigbuild --locked -p rama-examples --bin tls_boring_dynamic_certs --no-default-features --features boring,http-full --target {{TARGET}}
+
+# Link the focused downstream path that originally exposed the glibc resolver
+# symbol mismatch. This is also the inexpensive AArch64 CI gate.
+test-zigbuild-linux-gnu-native-dns TARGET="x86_64-unknown-linux-gnu.2.17":
+    cargo zigbuild --locked -p rama-examples --bin native_dns --features dns --target {{TARGET}}
+
+# Build the real CLI with its curated distribution features, independently of
+# workspace-wide feature unification.
+test-zigbuild-linux-gnu-cli TARGET="x86_64-unknown-linux-gnu.2.17":
+    @just _zigbuild-linux-gnu-with-native-env _zigbuild-linux-gnu-cli {{TARGET}}
+
+_zigbuild-linux-gnu-cli TARGET:
+    cargo zigbuild --locked -p rama-cli --bin rama --target {{TARGET}}
+
+# On a Linux x86_64 host, start the cross-built CLI to verify its ELF loader,
+# dynamic dependencies, allocator, and command-line entry point.
+test-zigbuild-linux-gnu-smoke BINARY="target/x86_64-unknown-linux-gnu/debug/rama":
+    chmod +x {{BINARY}}
+    {{BINARY}} --version
+
+# Cross-link every workspace target and feature. rama-fuzz is a cargo-fuzz
+# harness and gets its entry points from cargo fuzz rather than plain Cargo.
+test-zigbuild-linux-gnu-all TARGET="x86_64-unknown-linux-gnu.2.17":
+    @just _zigbuild-linux-gnu-with-native-env _zigbuild-linux-gnu-all {{TARGET}}
+
+_zigbuild-linux-gnu-all TARGET:
+    cargo zigbuild --locked --workspace --all-targets --all-features --exclude rama-fuzz --target {{TARGET}}
+
+# Native dependencies need the target archiver, while AWS-LC's cc builder uses
+# the compiler environment supplied by cargo-zigbuild. Keep the platform shell
+# details below this shared recipe boundary.
+_zigbuild-linux-gnu-with-native-env RECIPE TARGET:
+    @just _zigbuild-linux-gnu-with-native-env-{{os_family()}} {{RECIPE}} {{TARGET}}
+
+_zigbuild-linux-gnu-with-native-env-unix RECIPE TARGET:
+    AR="zig ar" AWS_LC_SYS_CMAKE_BUILDER=0 just {{RECIPE}} {{TARGET}}
+
+_zigbuild-linux-gnu-with-native-env-windows RECIPE TARGET:
+    $rustVersion = (Select-String -Path rust-toolchain.toml -Pattern '^channel = "([^"]+)"$').Matches[0].Groups[1].Value; $gitShell = (Get-Command sh.exe).Source; $shortShell = (New-Object -ComObject Scripting.FileSystemObject).GetFile($gitShell).ShortPath.Replace('\', '/'); $env:RUSTUP_TOOLCHAIN = "${rustVersion}-x86_64-pc-windows-gnu"; $env:MAKEFLAGS = "SHELL=$shortShell"; $env:AR = "zig ar"; $env:AWS_LC_SYS_CMAKE_BUILDER = "0"; just {{RECIPE}} {{TARGET}}
+
 # check no_std crates against a target without std: any dep that links
 # std fails loudly here instead of poisoning downstream no_std consumers
 # (e.g. kernel drivers hit E0152 duplicate panic_impl)
@@ -69,7 +132,9 @@ check-nostd:
     cargo check -p rama-utils --no-default-features --target x86_64-unknown-none
     cargo check -p rama-core --no-default-features --target x86_64-unknown-none
     cargo check -p rama-net --no-default-features --target x86_64-unknown-none
+    cargo check -p rama-icap --no-default-features --target x86_64-unknown-none
     cargo check -p rama --no-default-features --target x86_64-unknown-none
+    cargo check -p rama --no-default-features --features icap --target x86_64-unknown-none
     cargo check -p rama --no-default-features --features net --target x86_64-unknown-none
 
 check-links:
@@ -149,6 +214,12 @@ test-no-default-features *ARGS:
 test-doc *ARGS:
     cargo test --doc --all-features --workspace {{ARGS}}
 
+test-datastar-sdk *ARGS:
+    bash scripts/test-datastar-sdk.sh {{ARGS}}
+
+test-proxy-dashboard-browser:
+    node --test rama-cli/src/cmd/serve/proxy/dashboard-browser.test.cjs
+
 test-crate CRATE *ARGS:
     @command -v cargo-nextest >/dev/null || cargo install cargo-nextest --locked
     cargo nextest run --all-features -p {{CRATE}} {{ARGS}}
@@ -191,18 +262,21 @@ qq: sort-check fmt-check check check-nostd clippy doc extra-checks
 qa: qq docsrs-metadata-check test test-no-default-features test-doc deny
 
 # QA pass for the optional `dial9` runtime-telemetry feature. Builds, lints
-# and tests the rama crates that opt into dial9. `tokio_unstable` is
-# required by `dial9-tokio-telemetry` and is set workspace-wide in
-# `.cargo/config.toml` so this recipe does not need to set it explicitly.
+# and tests the rama crates that opt into dial9, on stable Tokio. Use
+# `qa-dial9-tokio-unstable` for the same pass with `--cfg tokio_unstable`.
 #
 # Kept separate from the main `qa` recipe so the standard QA path stays
 # focused — but is part of `qa-full` so anyone running the full suite
 # covers it. CI runs it as its own job.
 qa-dial9:
     @command -v cargo-nextest >/dev/null || cargo install cargo-nextest --locked
-    cargo check -p rama-net -p rama-net-apple-networkextension -p rama-dns -p rama-tls-rustls -p rama-tls-boring -p rama-socks5 -p rama --features dial9 --all-targets
-    cargo clippy -p rama-net -p rama-net-apple-networkextension -p rama-dns -p rama-tls-rustls -p rama-tls-boring -p rama-socks5 -p rama --features dial9 --all-targets
-    cargo nextest run -p rama-net -p rama-net-apple-networkextension -p rama-dns -p rama-socks5 --features dial9
+    cargo check -p rama-core -p rama-http -p rama-ws -p rama-net -p rama-net-apple-networkextension -p rama-dns -p rama-tls-rustls -p rama-tls-boring -p rama-socks5 -p rama --features dial9 --all-targets
+    cargo clippy -p rama-core -p rama-http -p rama-ws -p rama-net -p rama-net-apple-networkextension -p rama-dns -p rama-tls-rustls -p rama-tls-boring -p rama-socks5 -p rama --features dial9 --all-targets
+    cargo nextest run -p rama-core -p rama-http -p rama-ws -p rama-net -p rama-net-apple-networkextension -p rama-dns -p rama-socks5 --features dial9
+
+# `qa-dial9` under `--cfg tokio_unstable`, where dial9 gets its full task coverage.
+qa-dial9-tokio-unstable:
+    TOKIO_UNSTABLE=true just qa-dial9
 
 # Interactive: boot the fastcgi-php gateway demo (HTTPS → FastCGI/TCP → php-fpm)
 # and leave it running until Ctrl-C so you can curl / browse it.
@@ -216,6 +290,35 @@ example-fastcgi-php-migration:
 # CI/test: boot both, run jq assertions, tear down.
 test-fastcgi-php:
     ./examples/src/gateway/fastcgi-php/test.sh test
+
+# Build and start the pinned c-icap interoperability oracle.
+icap-oracle-up:
+    docker compose -f rama-icap/tests/oracle/c-icap/compose.yaml up --build --detach --wait
+
+# Ask c-icap's own client to perform OPTIONS against the echo service.
+icap-oracle-smoke: icap-oracle-up
+    docker compose -f rama-icap/tests/oracle/c-icap/compose.yaml exec -T c-icap /opt/c-icap/bin/c-icap-client -i 127.0.0.1 -p 1344 -s echo
+    docker compose -f rama-icap/tests/oracle/c-icap/compose.yaml exec -T c-icap-204 /opt/c-icap/bin/c-icap-client -i 127.0.0.1 -p 1344 -s echo
+
+# Run c-icap's client against c-icap's servers across the reference scenario matrix.
+icap-oracle-test:
+    bash rama-icap/tests/oracle/c-icap/run-matrix.sh
+
+# Run Rama's client against the pinned c-icap servers.
+icap-oracle-test-rama-client: icap-oracle-up
+    RAMA_ICAP_ORACLE_REQUIRED=1 RAMA_ICAP_ORACLE_ECHO_ADDR=127.0.0.1:${RAMA_ICAP_C_ICAP_PORT:-1345} RAMA_ICAP_ORACLE_204_ADDR=127.0.0.1:${RAMA_ICAP_C_ICAP_204_PORT:-1346} cargo test --locked -p rama-icap --features http --test c_icap_interop -- --include-ignored --nocapture
+
+# Run c-icap's full client matrix against local Rama servers.
+icap-oracle-test-rama-server-local:
+    rama-icap/tests/oracle/c-icap/rama-server-matrix.sh
+
+# Run the same C reference-client matrix against a Rama server on the host.
+icap-oracle-test-rama-server MODE="normal" HOST="host.docker.internal" PORT="1344":
+    docker compose -f rama-icap/tests/oracle/c-icap/compose.yaml run --build --rm --no-deps --entrypoint /opt/rama-icap-oracle/reference-matrix.sh c-icap {{MODE}} {{HOST}} {{PORT}} rama
+
+# Stop the c-icap oracle and remove its Compose resources.
+icap-oracle-down:
+    docker compose -f rama-icap/tests/oracle/c-icap/compose.yaml down --volumes --remove-orphans
 
 qa-crate CRATE:
     just fmt-check-crate {{CRATE}}
@@ -244,14 +347,28 @@ test-e2e-ffi-swift:
 
 test-ffi-apple-full: qa-ffi-apple test-e2e-ffi-apple test-e2e-ffi-swift qa-xpc-apple
 
-qa-full: qa qa-dial9 hack test-ignored test-ignored-release test-loom fuzz-60s check-links
+qa-full: qa qa-dial9 qa-dial9-tokio-unstable hack test-ignored test-ignored-release test-loom fuzz-60s check-links
 
 bench-e2e-http-client-server *ARGS:
     ./scripts/bench/e2e_http_client_server.py {{ARGS}}
 
-clean:
+clean: clean-rust clean-ffi-apple clean-js
+
+clean-rust:
     cargo clean
+    cargo clean --target-dir examples/target
+
+clean-ffi-apple:
     just ./ffi/apple/examples/transparent_proxy/clean
+
+clean-js:
+    @just _clean-js-{{os_family()}}
+
+_clean-js-unix:
+    rm -rf -- rama-js/engine/starling/.build
+
+_clean-js-windows:
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue rama-js/engine/starling/.build
 
 watch-docs:
     @cargo install cargo-watch
@@ -309,6 +426,32 @@ fuzz-http-header-map:
 fuzz-http-header-map-60s:
     cargo +nightly fuzz run http_header_map -- -max_len=131072 -max_total_time=60
 
+fuzz-icap-seeds-check:
+    @for seed in fuzz/corpus-seeds/icap_codec_roundtrip/*; do if [ "$(wc -c < "$seed")" -lt 38 ]; then echo "unreachable structured ICAP seed: $seed" >&2; exit 1; fi; done
+
+fuzz-icap: fuzz-icap-seeds-check
+    mkdir -p fuzz/corpus/icap_codec fuzz/corpus/icap_codec_roundtrip
+    cargo +nightly fuzz run icap_codec fuzz/corpus/icap_codec fuzz/corpus-seeds/icap_codec -- -dict=fuzz/dictionaries/icap.dict -max_len=65536 -timeout=5
+    cargo +nightly fuzz run icap_codec_roundtrip fuzz/corpus/icap_codec_roundtrip fuzz/corpus-seeds/icap_codec_roundtrip -- -max_len=64 -timeout=5
+
+fuzz-icap-60s: fuzz-icap-seeds-check
+    mkdir -p fuzz/corpus/icap_codec fuzz/corpus/icap_codec_roundtrip
+    cargo +nightly fuzz run icap_codec fuzz/corpus/icap_codec fuzz/corpus-seeds/icap_codec -- -dict=fuzz/dictionaries/icap.dict -max_len=65536 -timeout=5 -max_total_time=60
+    cargo +nightly fuzz run icap_codec_roundtrip fuzz/corpus/icap_codec_roundtrip fuzz/corpus-seeds/icap_codec_roundtrip -- -max_len=64 -timeout=5 -max_total_time=60
+
+# Sustained pre-release ICAP fuzzing. Override the durations for a shorter
+# local pass while keeping the release defaults visible and reproducible.
+fuzz-icap-release RAW_SECONDS="21600" ROUNDTRIP_SECONDS="7200": fuzz-icap-seeds-check
+    mkdir -p fuzz/corpus/icap_codec fuzz/corpus/icap_codec_roundtrip
+    cargo +nightly fuzz run -j 4 icap_codec fuzz/corpus/icap_codec fuzz/corpus-seeds/icap_codec -- -dict=fuzz/dictionaries/icap.dict -max_len=65536 -timeout=5 -max_total_time={{RAW_SECONDS}}
+    cargo +nightly fuzz run -j 4 icap_codec_roundtrip fuzz/corpus/icap_codec_roundtrip fuzz/corpus-seeds/icap_codec_roundtrip -- -max_len=64 -timeout=5 -max_total_time={{ROUNDTRIP_SECONDS}}
+
+fuzz-dns-txt-rr:
+    cargo +nightly fuzz run dns_txt_rr -- -max_len=4096
+
+fuzz-dns-txt-rr-60s:
+    cargo +nightly fuzz run dns_txt_rr -- -max_len=4096 -max_total_time=60
+
 fuzz-h2-main:
     # cargo install honggfuzz
     cd rama-http-core/tests/h2-fuzz && \
@@ -328,12 +471,15 @@ fuzz-h2-60s:
     cargo +nightly fuzz run h2_hpack -- -max_total_time=60
     cargo +nightly fuzz run h2_e2e -- -max_total_time=60
 
-fuzz-60s: fuzz-ua-60s fuzz-h2-60s fuzz-http-headers-x-robots-tag-60s fuzz-http-header-map-60s
+fuzz-60s: fuzz-ua-60s fuzz-h2-60s fuzz-http-headers-x-robots-tag-60s fuzz-http-header-map-60s fuzz-icap-60s
 
 fuzz-full: fuzz-60s fuzz-h2-main
 
 bench:
     cargo bench --features=full
+
+bench-icap *ARGS:
+    cargo bench -p rama-icap --features=http --bench icap -- {{ARGS}}
 
 vet:
     cargo vet
@@ -349,16 +495,6 @@ miri-apple-ne-ffi:
     cargo +nightly miri test -p rama-net-apple-networkextension ffi::bytes --lib
     cargo +nightly miri test -p rama-net-apple-networkextension ffi::tproxy::tests::ffi_enum_decoders_fail_safe_on_bad_byte --lib
     cargo +nightly miri test -p rama-net-apple-networkextension ffi::tproxy::tests::ffi_struct_layout_matches_c_header_on_64_bit_targets --lib
-
-# Targeted mutation pass for the Apple NetworkExtension FFI/config boundary.
-# This intentionally avoids the full Apple e2e surface so cargo-mutants can
-# produce useful signal without spending most of its time in system-extension
-# setup. Install with: cargo install cargo-mutants --locked
-mutants-apple-ne-ffi:
-    cargo mutants --package rama-net-apple-networkextension --file rama-net-apple-networkextension/src/ffi/bytes.rs --file rama-net-apple-networkextension/src/ffi/tproxy.rs --file rama-net-apple-networkextension/src/tproxy/types.rs --timeout 120
-
-mutants-http-headers:
-    cargo mutants --package rama-http-types --file rama-http-types/src/header/name.rs --file rama-http-types/src/header/map.rs --timeout 120
 
 detect-unused-deps:
     @cargo install cargo-machete

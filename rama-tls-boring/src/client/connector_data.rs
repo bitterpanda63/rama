@@ -1,4 +1,6 @@
 use crate::client::config::BoringTlsConnectorConfig;
+use ahash::{HashSet, HashSetExt as _};
+use moka::sync::Cache;
 use rama_boring::{
     asn1::Asn1Time,
     bn::{BigNum, MsbOption},
@@ -10,6 +12,7 @@ use rama_boring::{
         X509,
         extension::{BasicConstraints, KeyUsage, SubjectKeyIdentifier},
         store::{X509Store, X509StoreBuilder},
+        verify::X509VerifyFlags,
     },
 };
 use rama_core::error::BoxErrorExt as _;
@@ -19,14 +22,17 @@ use rama_core::{
     error::{BoxError, ErrorContext, ErrorExt},
 };
 use rama_crypto::dep::x509_parser::nom::AsBytes;
-use rama_net::address::{Domain, Host};
+use rama_net::{address::Host, tls::ApplicationProtocol};
+use rama_tls::KeyLogIntent;
 use rama_tls::client::ClientAuth;
-use rama_tls::client::ServerVerifyMode;
 use rama_tls::client::TlsClientConfig;
 use rama_tls::client::TlsServerCertPins;
-use rama_tls::client::TlsServerTrustAnchors;
-use rama_tls::{ApplicationProtocol, KeyLogIntent};
-use std::fmt;
+use rama_tls::client::{ServerTrustRoots, ServerVerifyMode};
+use rama_tls::client::{TlsServerTrust, TlsServerTrustAnchors};
+use std::{
+    fmt,
+    sync::{Arc, LazyLock},
+};
 
 #[cfg(feature = "compression")]
 use super::compress_certificate::{
@@ -41,8 +47,7 @@ use rama_tls::keylog::{KeyLogSink, open_intent_sink};
 pub struct TlsConnectorData {
     pub config: ConnectConfiguration,
     pub store_server_certificate_chain: bool,
-    pub server_name: Option<Domain>,
-    pub pin_server_name: Option<Host>,
+    pub server_name: Option<Host>,
     pub server_verify_mode: ServerVerifyMode,
     pub server_cert_pins: Option<TlsServerCertPins>,
 }
@@ -55,7 +60,6 @@ impl std::fmt::Debug for TlsConnectorData {
                 &self.store_server_certificate_chain,
             )
             .field("server_name", &self.server_name)
-            .field("pin_server_name", &self.pin_server_name)
             .field("server_verify_mode", &self.server_verify_mode)
             .field("has_server_cert_pins", &self.server_cert_pins.is_some())
             .finish()
@@ -81,10 +85,7 @@ impl TryFrom<BoringTlsConnectorConfig<'_>> for TlsConnectorData {
         let server_verify_mode = value.verify.map(|v| v.0).unwrap_or_default();
         let server_cert_pins = value.server_cert_pins.cloned();
         let store_server_certificate_chain = value.store_chain.map(|p| p.0).unwrap_or_default();
-        let pin_server_name = value.server_name.map(|s| s.0.clone());
-        let server_name = pin_server_name
-            .clone()
-            .and_then(|host| host.try_into_domain().ok());
+        let server_name = value.server_name.map(|s| s.0.clone());
 
         let keylog_intent = value
             .keylog
@@ -103,9 +104,9 @@ impl TryFrom<BoringTlsConnectorConfig<'_>> for TlsConnectorData {
         let record_size_limit = value.record_size_limit.map(|p| p.0);
         let server_verify_cert_store = value.verify_cert_store.map(|p| p.0.clone());
         if server_verify_mode == ServerVerifyMode::Disable {
-            if value.server_trust_anchors.is_some() {
+            if value.server_trust.is_some() {
                 debug!(
-                    "boring connector: server trust anchors ignored: server verification is disabled"
+                    "boring connector: server trust policy ignored: server verification is disabled"
                 );
             }
             if server_verify_cert_store.is_some() {
@@ -114,17 +115,18 @@ impl TryFrom<BoringTlsConnectorConfig<'_>> for TlsConnectorData {
                 );
             }
         }
-        let server_trust_anchor_store = match (server_verify_mode, value.server_trust_anchors) {
-            (ServerVerifyMode::Auto, Some(anchors)) => {
+        let server_trust_store = match (server_verify_mode, value.server_trust) {
+            (ServerVerifyMode::Auto, Some(trust)) => {
                 if server_verify_cert_store.is_some() {
                     debug!(
-                        "boring connector: server trust anchors ignored: custom certificate store takes precedence"
+                        "boring connector: server trust policy ignored: custom certificate store takes precedence"
                     );
                     None
                 } else {
-                    Some(build_custom_server_verify_store(anchors)?)
+                    Some(resolve_server_trust_store(trust)?)
                 }
             }
+            (ServerVerifyMode::Auto, None) => Some(ResolvedServerTrustStore::Default),
             _ => None,
         };
         let alps = value.alps.map(|p| (p.protocols.clone(), p.new_codepoint));
@@ -233,12 +235,9 @@ impl TryFrom<BoringTlsConnectorConfig<'_>> for TlsConnectorData {
         if let Some(store) = &server_verify_cert_store {
             trace!("boring connector: set provided cert store to verify as server");
             cfg_builder.set_cert_store_ref(store);
-        } else if let Some(store) = server_trust_anchor_store {
-            trace!("boring connector: set custom server trust anchors");
-            cfg_builder.set_cert_store_builder(store);
         } else {
-            match server_verify_mode {
-                ServerVerifyMode::Disable => {
+            match (server_verify_mode, server_trust_store) {
+                (ServerVerifyMode::Disable, _) => {
                     // Verification is disabled (a NONE verify callback is
                     // installed below), so the trust store is never consulted:
                     // leave the empty store from `no_default_verify_builder`
@@ -247,12 +246,20 @@ impl TryFrom<BoringTlsConnectorConfig<'_>> for TlsConnectorData {
                         "boring connector: server verification disabled; no verify cert store loaded"
                     );
                 }
-                ServerVerifyMode::Auto => {
+                (ServerVerifyMode::Auto, Some(ResolvedServerTrustStore::Default) | None) => {
                     // Install a process-wide, parse-once shared OS default store
                     // so every connector references one copy instead of
                     // re-parsing the bundle on every build.
                     trace!("boring connector: using shared default verify cert store");
                     cfg_builder.set_cert_store_ref(shared_default_verify_store()?);
+                }
+                (ServerVerifyMode::Auto, Some(ResolvedServerTrustStore::WebPki)) => {
+                    trace!("boring connector: using shared WebPKI verify cert store");
+                    cfg_builder.set_cert_store_ref(shared_webpki_verify_store()?);
+                }
+                (ServerVerifyMode::Auto, Some(ResolvedServerTrustStore::Derived(store))) => {
+                    trace!("boring connector: using shared derived server verify cert store");
+                    cfg_builder.set_cert_store_ref(store.as_ref());
                 }
             }
         }
@@ -431,25 +438,128 @@ impl TryFrom<BoringTlsConnectorConfig<'_>> for TlsConnectorData {
             config: cfg,
             store_server_certificate_chain,
             server_name,
-            pin_server_name,
             server_verify_mode,
             server_cert_pins,
         })
     }
 }
 
-fn build_custom_server_verify_store(
-    anchors: &TlsServerTrustAnchors,
-) -> Result<X509StoreBuilder, BoxError> {
-    let mut builder = X509StoreBuilder::new().context("create custom server trust store")?;
-    for certificate in anchors.certificates() {
-        let certificate =
-            X509::from_der(certificate.as_ref()).context("parse custom server trust anchor")?;
-        builder
-            .add_cert(certificate)
-            .context("add custom server trust anchor to boring x509 store")?;
+enum ResolvedServerTrustStore {
+    Default,
+    WebPki,
+    Derived(Arc<X509Store>),
+}
+
+fn resolve_server_trust_store(
+    trust: &TlsServerTrust,
+) -> Result<ResolvedServerTrustStore, BoxError> {
+    match (trust.roots(), trust.additional_anchors()) {
+        (ServerTrustRoots::Default, None) => Ok(ResolvedServerTrustStore::Default),
+        (ServerTrustRoots::WebPki, None) => Ok(ResolvedServerTrustStore::WebPki),
+        _ => cached_server_verify_store(trust).map(ResolvedServerTrustStore::Derived),
     }
-    Ok(builder)
+}
+
+fn cached_server_verify_store(trust: &TlsServerTrust) -> Result<Arc<X509Store>, BoxError> {
+    const MAX_CACHED_TRUST_POLICIES: u64 = 64;
+    static STORES: LazyLock<Cache<TlsServerTrust, Arc<X509Store>>> = LazyLock::new(|| {
+        Cache::builder()
+            .max_capacity(MAX_CACHED_TRUST_POLICIES)
+            .build()
+    });
+
+    STORES
+        .entry(trust.clone())
+        .or_try_insert_with(|| build_server_verify_store(trust).map(Arc::new))
+        .map(|entry| entry.into_value())
+        .map_err(|err| {
+            err.to_string()
+                .context("build cached derived server trust store")
+                .into_box_error()
+        })
+}
+
+fn build_server_verify_store(trust: &TlsServerTrust) -> Result<X509Store, BoxError> {
+    let mut builder = X509StoreBuilder::new().context("create server trust store")?;
+    // Custom roots intentionally include intermediate or end-entity trust
+    // anchors, which require partial-chain verification in BoringSSL.
+    builder.set_flags(X509VerifyFlags::PARTIAL_CHAIN);
+    let mut added = HashSet::new();
+
+    match trust.roots() {
+        ServerTrustRoots::Default => add_builtin_trust_anchors(
+            &mut builder,
+            &mut added,
+            &rama_crypto::native_certs::shared_native_trust_anchors(),
+            "native",
+        ),
+        ServerTrustRoots::WebPki => add_builtin_trust_anchors(
+            &mut builder,
+            &mut added,
+            rama_crypto::native_certs::bundled_root_certs(),
+            "WebPKI",
+        ),
+        ServerTrustRoots::Custom(anchors) => {
+            add_configured_trust_anchors(&mut builder, &mut added, anchors)?;
+        }
+    }
+    if let Some(anchors) = trust.additional_anchors() {
+        add_configured_trust_anchors(&mut builder, &mut added, anchors)?;
+    }
+
+    if added.is_empty() {
+        return Err(BoxError::from_static_str(
+            "no server trust anchors could be added to the boring x509 verify store",
+        ));
+    }
+    Ok(builder.build())
+}
+
+fn add_configured_trust_anchors(
+    builder: &mut X509StoreBuilder,
+    added: &mut HashSet<[u8; 32]>,
+    anchors: &TlsServerTrustAnchors,
+) -> Result<(), BoxError> {
+    for der in anchors.certificates() {
+        let digest = rama_boring::sha::sha256(der.as_ref());
+        if added.contains(&digest) {
+            continue;
+        }
+        let certificate =
+            X509::from_der(der.as_ref()).context("parse configured server trust anchor")?;
+        builder
+            .add_cert(&certificate)
+            .context("add configured server trust anchor to boring x509 store")?;
+        added.insert(digest);
+    }
+    Ok(())
+}
+
+fn add_builtin_trust_anchors(
+    builder: &mut X509StoreBuilder,
+    added: &mut HashSet<[u8; 32]>,
+    anchors: &[rama_crypto::pki_types::CertificateDer<'static>],
+    kind: &'static str,
+) {
+    for der in anchors {
+        let digest = rama_boring::sha::sha256(der.as_ref());
+        if added.contains(&digest) {
+            continue;
+        }
+        match X509::from_der(der.as_ref()) {
+            Ok(cert) => match builder.add_cert(&cert) {
+                Ok(()) => {
+                    added.insert(digest);
+                }
+                Err(err) => {
+                    debug!(%err, trust_anchor_kind = kind, "boring connector: failed to add built-in trust anchor");
+                }
+            },
+            Err(err) => {
+                debug!(%err, trust_anchor_kind = kind, "boring connector: failed to parse built-in trust anchor");
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -467,13 +577,25 @@ pub struct ConnectorConfigClientAuth {
 /// both the `rustls` and `boring` backends. Every connector references this one
 /// store via `set_cert_store_ref` instead of re-parsing a bundle per build.
 fn shared_default_verify_store() -> Result<&'static X509Store, BoxError> {
-    static STORE: std::sync::LazyLock<Result<X509Store, BoxError>> =
-        std::sync::LazyLock::new(build_os_default_verify_store);
+    static STORE: LazyLock<Result<X509Store, BoxError>> =
+        LazyLock::new(build_os_default_verify_store);
     match &*STORE {
         Ok(store) => Ok(store),
         Err(err) => Err(err
             .to_string()
             .context("shared default verify store")
+            .into_box_error()),
+    }
+}
+
+/// Process-wide store containing Rama's bundled Mozilla (CCADB) roots.
+fn shared_webpki_verify_store() -> Result<&'static X509Store, BoxError> {
+    static STORE: LazyLock<Result<X509Store, BoxError>> = LazyLock::new(build_webpki_verify_store);
+    match &*STORE {
+        Ok(store) => Ok(store),
+        Err(err) => Err(err
+            .to_string()
+            .context("shared WebPKI verify store")
             .into_box_error()),
     }
 }
@@ -491,33 +613,39 @@ fn build_os_default_verify_store() -> Result<X509Store, BoxError> {
         anchor_count = anchors.len(),
         "boring connector: building shared verify store from native trust anchors"
     );
+    build_builtin_verify_store(&anchors, "native")
+}
 
+fn build_webpki_verify_store() -> Result<X509Store, BoxError> {
+    let anchors = rama_crypto::native_certs::bundled_root_certs();
+    trace!(
+        anchor_count = anchors.len(),
+        "boring connector: building shared verify store from bundled WebPKI roots"
+    );
+    build_builtin_verify_store(anchors, "WebPKI")
+}
+
+fn build_builtin_verify_store(
+    anchors: &[rama_crypto::pki_types::CertificateDer<'static>],
+    kind: &'static str,
+) -> Result<X509Store, BoxError> {
     let mut builder =
-        X509StoreBuilder::new().context("create x509 store builder for native trust anchors")?;
+        X509StoreBuilder::new().context("create x509 store builder for built-in trust anchors")?;
+    // Native trust stores can deliberately contain non-self-signed trust
+    // anchors. WebPKI roots are self-signed, so the flag is inert there.
+    builder.set_flags(X509VerifyFlags::PARTIAL_CHAIN);
+    let mut added = HashSet::new();
+    add_builtin_trust_anchors(&mut builder, &mut added, anchors, kind);
 
-    let mut added = 0_usize;
-    let mut failed = 0_usize;
-    for der in anchors.iter() {
-        match X509::from_der(der.as_ref()) {
-            Ok(cert) => match builder.add_cert(cert) {
-                Ok(()) => added += 1,
-                Err(err) => {
-                    failed += 1;
-                    debug!(%err, "boring connector: failed to add native trust anchor to store");
-                }
-            },
-            Err(err) => {
-                failed += 1;
-                debug!(%err, "boring connector: failed to parse native trust anchor as x509");
-            }
-        }
-    }
+    trace!(
+        added = added.len(),
+        trust_anchor_kind = kind,
+        "boring connector: shared verify store built"
+    );
 
-    trace!(added, failed, "boring connector: shared verify store built");
-
-    if added == 0 {
+    if added.is_empty() {
         return Err(BoxError::from_static_str(
-            "no native trust anchors could be added to the boring x509 verify store",
+            "no built-in trust anchors could be added to the boring x509 verify store",
         ));
     }
 
@@ -639,11 +767,12 @@ mod tests {
     use crate::client::{BoringMaxVersion, BoringSignatureSchemes};
     use rama_core::extensions::Extensions;
     use rama_crypto::pki_types::CertificateDer;
+    use rama_net::tls::TlsAlpn;
     use rama_tls::client::{
-        ClientHello, ClientHelloExtension, TlsServerCertPins, TlsServerVerify,
-        TlsStoreServerCertChain,
+        ClientHello, ClientHelloExtension, TlsServerCertPins, TlsServerTrust,
+        TlsServerTrustAnchors, TlsServerVerify, TlsStoreServerCertChain,
     };
-    use rama_tls::{CipherSuite, ProtocolVersion, SignatureScheme, TlsAlpn};
+    use rama_tls::{CipherSuite, ProtocolVersion, SignatureScheme};
 
     #[test]
     fn build_from_common_pieces() {
@@ -695,9 +824,9 @@ mod tests {
 
     #[test]
     fn custom_server_trust_anchors_build_default_verifier() {
-        use rama_crypto::cert::{SelfSignedData, self_signed_server_auth};
+        use rama_crypto::cert::{GeneratedServerAuthConfig, generate_server_auth};
 
-        let (chain, _) = self_signed_server_auth(SelfSignedData::default()).unwrap();
+        let (chain, _) = generate_server_auth(GeneratedServerAuthConfig::default()).unwrap();
         let config = TlsClientConfig::new()
             .try_with_server_trust_anchors([chain[1].clone()])
             .unwrap();
@@ -706,10 +835,71 @@ mod tests {
     }
 
     #[test]
+    fn exact_builtin_trust_policies_use_shared_stores() {
+        assert!(matches!(
+            resolve_server_trust_store(&TlsServerTrust::default_roots()).unwrap(),
+            ResolvedServerTrustStore::Default
+        ));
+        assert!(matches!(
+            resolve_server_trust_store(&TlsServerTrust::webpki_roots()).unwrap(),
+            ResolvedServerTrustStore::WebPki
+        ));
+
+        shared_default_verify_store().unwrap();
+        shared_webpki_verify_store().unwrap();
+
+        let anchors = rama_crypto::native_certs::bundled_root_certs();
+        let mut store = X509StoreBuilder::new().unwrap();
+        let mut added = HashSet::new();
+        add_builtin_trust_anchors(&mut store, &mut added, anchors, "WebPKI");
+        assert_eq!(added.len(), anchors.len());
+    }
+
+    #[test]
+    fn additional_trust_anchors_extend_default_and_webpki_roots() {
+        use rama_crypto::cert::{GeneratedServerAuthConfig, generate_server_auth};
+
+        let (chain, _) = generate_server_auth(GeneratedServerAuthConfig::default()).unwrap();
+        let anchor = chain[1].clone();
+
+        for trust in [
+            TlsServerTrust::default_roots()
+                .try_with_additional_anchors([anchor.clone()])
+                .unwrap(),
+            TlsServerTrust::webpki_roots()
+                .try_with_additional_anchors([anchor])
+                .unwrap(),
+        ] {
+            let ResolvedServerTrustStore::Derived(first) =
+                resolve_server_trust_store(&trust).unwrap()
+            else {
+                panic!("expected derived trust store");
+            };
+            let ResolvedServerTrustStore::Derived(second) =
+                resolve_server_trust_store(&trust).unwrap()
+            else {
+                panic!("expected derived trust store");
+            };
+            assert!(Arc::ptr_eq(&first, &second));
+            TlsConnectorData::try_from(&TlsClientConfig::new().with_server_trust(trust)).unwrap();
+        }
+    }
+
+    #[test]
     fn invalid_server_trust_anchor_is_rejected() {
         let config = TlsClientConfig::new()
             .try_with_server_trust_anchors([CertificateDer::from(vec![1, 2, 3])])
             .unwrap();
+
+        TlsConnectorData::try_from(&config).unwrap_err();
+    }
+
+    #[test]
+    fn invalid_additional_server_trust_anchor_is_rejected() {
+        let trust = TlsServerTrust::webpki_roots()
+            .try_with_additional_anchors([CertificateDer::from(vec![1, 2, 3])])
+            .unwrap();
+        let config = TlsClientConfig::new().with_server_trust(trust);
 
         TlsConnectorData::try_from(&config).unwrap_err();
     }
@@ -724,6 +914,17 @@ mod tests {
             .try_with_server_trust_anchors([CertificateDer::from(vec![1, 2, 3])])
             .unwrap()
             .with_server_verify_cert_store(std::sync::Arc::new(store));
+
+        TlsConnectorData::try_from(&config).unwrap();
+    }
+
+    #[test]
+    fn disabled_verification_ignores_invalid_trust_policy() {
+        let invalid =
+            TlsServerTrustAnchors::try_new([CertificateDer::from(vec![1, 2, 3])]).unwrap();
+        let config = TlsClientConfig::new()
+            .with_server_verify(ServerVerifyMode::Disable)
+            .with_server_trust(TlsServerTrust::custom(invalid));
 
         TlsConnectorData::try_from(&config).unwrap();
     }

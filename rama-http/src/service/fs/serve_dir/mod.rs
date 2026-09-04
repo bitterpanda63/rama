@@ -51,6 +51,7 @@ pub struct ServeDir<F = DefaultServeDirFallback> {
     base: DirSource,
     buf_chunk_size: usize,
     symlink_policy: ServeDirSymlinkPolicy,
+    ignore_multi_range_requests: bool,
     precompressed_variants: Option<PrecompressedVariants>,
     // This is used to specialise implementation for
     // single files
@@ -83,9 +84,11 @@ impl ServeDir<DefaultServeDirFallback> {
             base,
             buf_chunk_size: DEFAULT_CAPACITY,
             symlink_policy: ServeDirSymlinkPolicy::default(),
+            ignore_multi_range_requests: false,
             precompressed_variants: None,
             variant: ServeVariant::Directory {
                 serve_mode: Default::default(),
+                redirect_to_trailing_slash: true,
                 html_as_default_extension: false,
             },
             fallback: None,
@@ -102,6 +105,7 @@ impl ServeDir<DefaultServeDirFallback> {
             base: DirSource::Filesystem(path.as_ref().to_path_buf()),
             buf_chunk_size: DEFAULT_CAPACITY,
             symlink_policy: ServeDirSymlinkPolicy::default(),
+            ignore_multi_range_requests: false,
             precompressed_variants: None,
             variant: ServeVariant::SingleFile { mime },
             fallback: None,
@@ -117,6 +121,30 @@ impl<F> ServeDir<F> {
             match &mut self.variant {
                 ServeVariant::Directory { serve_mode, .. } => {
                     *serve_mode = mode;
+                    self
+                }
+                ServeVariant::SingleFile { mime: _ } => self,
+            }
+        }
+    }
+
+    rama_utils::macros::generate_set_and_with! {
+        /// Whether to redirect directory requests without a trailing slash.
+        ///
+        /// When enabled, a request to `/dir` redirects to `/dir/`. When disabled,
+        /// `/dir/index.html` is served directly at `/dir` if
+        /// [`DirectoryServeMode::AppendIndexHtml`] is active.
+        ///
+        /// Has no effect for [`ServeFile`](super::ServeFile) (single-file mode).
+        ///
+        /// Defaults to `true`.
+        pub fn redirect_to_trailing_slash(mut self, redirect: bool) -> Self {
+            match &mut self.variant {
+                ServeVariant::Directory {
+                    redirect_to_trailing_slash,
+                    ..
+                } => {
+                    *redirect_to_trailing_slash = redirect;
                     self
                 }
                 ServeVariant::SingleFile { mime: _ } => self,
@@ -161,6 +189,22 @@ impl<F> ServeDir<F> {
         /// do not resolve filesystem symlinks.
         pub fn symlink_policy(mut self, policy: ServeDirSymlinkPolicy) -> Self {
             self.symlink_policy = policy;
+            self
+        }
+    }
+
+    rama_utils::macros::generate_set_and_with! {
+        /// Configure whether syntactically valid multi-range requests should be ignored.
+        ///
+        /// When enabled, a request containing multiple byte ranges is served as a normal full
+        /// response with status `200 OK`, as if the `Range` header were absent. This check happens
+        /// before semantic range validation, so overlapping, reversed, or otherwise unsatisfiable
+        /// multi-range requests are also ignored. Malformed range headers and unsatisfiable
+        /// single-range requests still result in `416 Range Not Satisfiable`.
+        ///
+        /// Defaults to `false`.
+        pub fn ignore_multi_range_requests(mut self, ignore: bool) -> Self {
+            self.ignore_multi_range_requests = ignore;
             self
         }
     }
@@ -252,6 +296,7 @@ impl<F> ServeDir<F> {
             base: self.base,
             buf_chunk_size: self.buf_chunk_size,
             symlink_policy: self.symlink_policy,
+            ignore_multi_range_requests: self.ignore_multi_range_requests,
             precompressed_variants: self.precompressed_variants,
             variant: self.variant,
             fallback: Some(new_fallback),
@@ -280,13 +325,19 @@ impl<F> ServeDir<F> {
     /// Call the service and get a future that contains any `std::io::Error` that might have
     /// happened.
     ///
-    /// By default `<ServeDir as Service<_>>::call` will handle IO errors and convert them into
+    /// This only returns I/O errors encountered while serving the request. Invalid request paths
+    /// and unsupported methods are represented as responses. When a fallback is configured,
+    /// errors that the default service would convert to `404 Not Found` call the fallback instead
+    /// of being returned.
+    ///
+    /// By default `<ServeDir as Service<_>>::serve` will handle IO errors and convert them into
     /// responses. It does that by converting [`std::io::ErrorKind::NotFound`] and
-    /// [`std::io::ErrorKind::PermissionDenied`] to `404 Not Found` and any other error to `500
-    /// Internal Server Error`. The error will also be logged with `tracing`.
+    /// [`std::io::ErrorKind::PermissionDenied`] to `404 Not Found`. On Unix, errors indicating
+    /// that a path component is not a directory are also converted to `404 Not Found`. Any other
+    /// error is converted to `500 Internal Server Error` and will also be logged with `tracing`.
     ///
     /// If you want to manually control how the error response is generated you can make a new
-    /// service that wraps a `ServeDir` and calls `try_call` instead of `call`.
+    /// service that wraps a `ServeDir` and calls `try_call` instead of `serve`.
     pub async fn try_call<ReqBody, FResBody>(
         &self,
         req: Request<ReqBody>,
@@ -368,6 +419,7 @@ impl<F> ServeDir<F> {
             req,
             negotiated_encodings,
             range_header.as_deref(),
+            self.ignore_multi_range_requests,
             buf_chunk_size,
             &self.base,
             precompression_configured,
@@ -391,8 +443,12 @@ where
     async fn serve(&self, req: Request<ReqBody>) -> Result<Self::Output, Self::Error> {
         let result = self.try_call(req).await;
         Ok(result.unwrap_or_else(|err| {
-            tracing::error!("Failed to read file: {err:?}");
-            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            if future::should_return_not_found(&err) {
+                StatusCode::NOT_FOUND.into_response()
+            } else {
+                tracing::error!("Failed to read file: {err:?}");
+                StatusCode::INTERNAL_SERVER_ERROR.into_response()
+            }
         }))
     }
 }
@@ -538,6 +594,9 @@ impl TryFrom<&str> for DirectoryServeMode {
 enum ServeVariant {
     Directory {
         serve_mode: DirectoryServeMode,
+        /// If true, requests for directories without a trailing slash redirect
+        /// to the slash-terminated URI before the directory is served.
+        redirect_to_trailing_slash: bool,
         /// If true, requests for a path without a file extension that doesn't
         /// resolve to anything will be retried with `.html` appended.
         html_as_default_extension: bool,

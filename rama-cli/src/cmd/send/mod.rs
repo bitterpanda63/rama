@@ -1,14 +1,15 @@
 use rama::{
-    error::{BoxError, BoxErrorExt, ErrorContext, ErrorExt},
+    error::{BoxError, BoxErrorExt as _, ErrorExt as _},
     json::path::JsonPath,
-    net::{Protocol, address::ProxyAddress, uri::Uri, user::Basic},
+    net::{Protocol, address::ProxyAddress, user::Basic},
     utils::str::NonEmptyStr,
 };
 
 use clap::Args;
-use std::path::PathBuf;
+use std::{convert::Infallible, path::PathBuf, str::FromStr};
 
-pub mod file;
+use super::uri::parse_user_uri;
+
 pub mod http;
 
 mod arg;
@@ -19,27 +20,35 @@ pub async fn run(cfg: SendCommand) -> Result<(), BoxError> {
         return Err(BoxError::from_static_str("empty URI is not valid"));
     }
 
-    // Canonical URI parse — relies on rama's RFC 3986 parser instead
-    // of an ad-hoc `split_once("://")`. Inputs without a scheme are
-    // treated as `http://` (curl-compatible default).
-    let normalized: std::borrow::Cow<'_, str> = if cfg.uri.contains("://") {
-        std::borrow::Cow::Borrowed(cfg.uri.as_str())
-    } else {
-        std::borrow::Cow::Owned(format!("http://{}", cfg.uri))
-    };
-    let uri = Uri::parse_canonical(normalized.as_ref()).context("parse request URI")?;
+    let uri = parse_user_uri(&cfg.uri)?;
     let scheme = uri.scheme().cloned().unwrap_or(Protocol::HTTP);
 
-    if scheme == Protocol::FILE {
-        return file::run(&uri).await;
-    }
-
     let is_ws = scheme.is_ws();
-    if scheme.is_http() || is_ws {
+    // file:// and data: are served by client layers, so they take the
+    // same path as http and get all its output handling
+    if scheme.is_http() || is_ws || scheme == Protocol::FILE || scheme == Protocol::DATA {
         return http::run(cfg, is_ws).await;
     }
     Err(BoxError::from_static_str("scheme is not supported")
         .context_str_field("scheme", scheme.as_str()))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum EmulationProfiles {
+    Embedded,
+    File(PathBuf),
+}
+
+impl FromStr for EmulationProfiles {
+    type Err = Infallible;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        Ok(if value == "@embedded" {
+            Self::Embedded
+        } else {
+            Self::File(value.into())
+        })
+    }
 }
 
 #[derive(Debug, Args)]
@@ -123,7 +132,9 @@ pub struct SendCommand {
     form_data: Option<Vec<String>>,
 
     #[arg(long, short = 'x')]
-    /// upstream proxy to use (can also be specified using PROXY env variable)
+    /// Upstream proxy to use. NO_PROXY still applies. Without this option,
+    /// scheme-specific and all-protocol proxy environment variables are tried
+    /// before operating-system settings.
     proxy: Option<ProxyAddress>,
 
     #[arg(long, short = 'U')]
@@ -206,15 +217,31 @@ pub struct SendCommand {
     /// Write output to the given file instead of stdout
     output: Option<PathBuf>,
 
+    #[arg(long, value_name = "FILE")]
+    /// (HTTP/WebSocket) Record the complete exchange to this HAR file.
+    har: Option<PathBuf>,
+
+    #[arg(long, requires = "har")]
+    /// Preserve sensitive headers such as Authorization, Cookie and Set-Cookie in the HAR file.
+    /// By default these headers are removed from recordings.
+    har_preserve_sensitive: bool,
+
     #[arg(long = "select-json", value_name = "JSONPATH")]
     /// Select JSON response values with JSONPath and print each match on its own line.
     select_json: Vec<JsonPath>,
 
-    #[arg(long)]
-    /// emulate the provided user-agent
+    #[arg(
+        long,
+        value_name = "JSON_FILE",
+        num_args = 0..=1,
+        require_equals = true,
+        default_missing_value = "@embedded"
+    )]
+    /// Emulate the provided User-Agent using Rama's embedded profiles.
     ///
-    /// (or a random one if no user-agent header is defined)
-    emulate: bool,
+    /// Pass `--emulate=profiles.json` to use a custom exported profile database.
+    /// A random profile is selected when no User-Agent header is defined.
+    emulate: Option<EmulationProfiles>,
 
     #[arg(long = "http0.9")]
     /// (HTTP) force http_version to http/0.9

@@ -1,4 +1,5 @@
-/// Multiply by 1024 to express a byte count in kibibytes (KiB).
+/// Multiply by 1024 to express a byte count in kibibytes (KiB), saturating
+/// at [`usize::MAX`] instead of wrapping.
 ///
 /// Returns `usize`; use [`kib_u64`] when you need a `u64`.
 ///
@@ -10,10 +11,11 @@
 #[inline]
 #[must_use]
 pub const fn kib(n: usize) -> usize {
-    n * 1024
+    n.saturating_mul(1024)
 }
 
-/// Multiply by 1024² to express a byte count in mebibytes (MiB).
+/// Multiply by 1024² to express a byte count in mebibytes (MiB), saturating
+/// at [`usize::MAX`] instead of wrapping.
 ///
 /// Returns `usize`; use [`mib_u64`] when you need a `u64`.
 ///
@@ -25,7 +27,7 @@ pub const fn kib(n: usize) -> usize {
 #[inline]
 #[must_use]
 pub const fn mib(n: usize) -> usize {
-    n * 1024 * 1024
+    kib(kib(n))
 }
 
 /// `u32` variant of [`kib`].
@@ -38,7 +40,7 @@ pub const fn mib(n: usize) -> usize {
 #[inline]
 #[must_use]
 pub const fn kib_u32(n: u32) -> u32 {
-    n * 1024
+    n.saturating_mul(1024)
 }
 
 /// `u32` variant of [`mib`].
@@ -51,7 +53,7 @@ pub const fn kib_u32(n: u32) -> u32 {
 #[inline]
 #[must_use]
 pub const fn mib_u32(n: u32) -> u32 {
-    n * 1024 * 1024
+    kib_u32(kib_u32(n))
 }
 
 /// `u64` variant of [`kib`].
@@ -64,7 +66,7 @@ pub const fn mib_u32(n: u32) -> u32 {
 #[inline]
 #[must_use]
 pub const fn kib_u64(n: u64) -> u64 {
-    n * 1024
+    n.saturating_mul(1024)
 }
 
 /// `u64` variant of [`mib`].
@@ -77,7 +79,61 @@ pub const fn kib_u64(n: u64) -> u64 {
 #[inline]
 #[must_use]
 pub const fn mib_u64(n: u64) -> u64 {
-    n * 1024 * 1024
+    kib_u64(kib_u64(n))
+}
+
+/// Multiply by 1024³ to express a byte count in gibibytes (GiB), saturating
+/// at [`usize::MAX`] instead of wrapping.
+///
+/// Returns `usize`; use [`gib_u64`] when you need a `u64`.
+///
+/// ```
+/// use rama_utils::octets::gib;
+/// const LIMIT: usize = gib(2);
+/// assert_eq!(LIMIT, 2 * 1024 * 1024 * 1024);
+/// ```
+#[inline]
+#[must_use]
+pub const fn gib(n: usize) -> usize {
+    kib(mib(n))
+}
+
+/// `u64` variant of [`gib`].
+///
+/// ```
+/// use rama_utils::octets::gib_u64;
+/// const LIMIT: u64 = gib_u64(2);
+/// assert_eq!(LIMIT, 2 * 1024 * 1024 * 1024);
+/// ```
+#[inline]
+#[must_use]
+pub const fn gib_u64(n: u64) -> u64 {
+    kib_u64(mib_u64(n))
+}
+
+/// Convert a bit count into a byte (octet) count.
+///
+/// Useful to express link rates: `100 Mbit/s == from_bits_u64(100_000_000)
+/// bytes per second`.
+///
+/// # Panics
+///
+/// Panics if `bits` is not a multiple of 8. In const contexts this is a
+/// compile-time error; validate first when converting dynamic input.
+///
+/// ```
+/// use rama_utils::octets::from_bits_u64;
+/// const RATE: u64 = from_bits_u64(100_000_000);
+/// assert_eq!(RATE, 12_500_000);
+/// ```
+#[inline]
+#[must_use]
+pub const fn from_bits_u64(bits: u64) -> u64 {
+    assert!(
+        bits.is_multiple_of(8),
+        "from_bits_u64: bits must be a multiple of 8"
+    );
+    bits / 8
 }
 
 /// A helper function that unpacks a sequence of 2 bytes found in the buffer with
@@ -160,6 +216,27 @@ mod tests {
     }
 
     #[test]
+    fn test_gib() {
+        assert_eq!(gib(0), 0);
+        assert_eq!(gib(3), 3 * 1024 * 1024 * 1024);
+        assert_eq!(gib_u64(0), 0);
+        assert_eq!(gib_u64(8), 8 * 1024 * 1024 * 1024);
+    }
+
+    #[test]
+    fn test_from_bits_u64() {
+        assert_eq!(from_bits_u64(0), 0);
+        assert_eq!(from_bits_u64(8), 1);
+        assert_eq!(from_bits_u64(1_000_000_000), 125_000_000);
+    }
+
+    #[test]
+    #[should_panic(expected = "multiple of 8")]
+    fn test_from_bits_u64_non_octet_panics() {
+        assert_eq!(from_bits_u64(12), 0);
+    }
+
+    #[test]
     fn test_kib_mib_const_context() {
         const K: usize = kib(4);
         const M: usize = mib(2);
@@ -169,5 +246,17 @@ mod tests {
         assert_eq!(M, 2 * 1024 * 1024);
         assert_eq!(K64, 4 * 1024);
         assert_eq!(M64, 2 * 1024 * 1024);
+    }
+
+    #[test]
+    fn byte_unit_helpers_saturate_instead_of_wrapping() {
+        assert_eq!(kib(usize::MAX), usize::MAX);
+        assert_eq!(mib(usize::MAX), usize::MAX);
+        assert_eq!(gib(usize::MAX), usize::MAX);
+        assert_eq!(kib_u32(u32::MAX), u32::MAX);
+        assert_eq!(mib_u32(u32::MAX), u32::MAX);
+        assert_eq!(kib_u64(u64::MAX), u64::MAX);
+        assert_eq!(mib_u64(u64::MAX), u64::MAX);
+        assert_eq!(gib_u64(u64::MAX), u64::MAX);
     }
 }

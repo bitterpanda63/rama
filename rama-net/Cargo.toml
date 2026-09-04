@@ -31,6 +31,7 @@ targets = [
 [features]
 default = ["std"]
 std = [
+    "dep:arc-swap",
     "rama-macros/std",
     "rama-utils/std",
     "ipnet/std",
@@ -42,14 +43,20 @@ std = [
     "dep:tokio-util",
     "dep:libc",
     "dep:windows-sys",
+    "dep:jni",
+    "dep:ndk-context",
+    "dep:core-foundation",
     "rama-core/std",
     "dep:ahash",
     "dep:radix_trie",
     "itertools/use_std",
     "memchr/std",
+    "dep:moka",
     "percent-encoding/std",
+    "dep:mime",
+    "dep:base64",
 ]
-http = ["std"]
+test-utils = ["std"]
 # IDNA (internationalized domain names) support.
 #
 # Pulls a non-trivial Unicode-table dependency; keep off if your traffic is ASCII-only.
@@ -60,22 +67,20 @@ mmap = ["std", "dep:memmap2"]
 opentelemetry = ["std", "rama-core/opentelemetry"]
 # Optional [dial9] runtime telemetry support.
 #
-# Building with this feature requires `--cfg tokio_unstable`.
+# `--cfg tokio_unstable` widens dial9's task coverage.
 #
-# [dial9]: https://github.com/dial9-rs/dial9-tokio-telemetry
-dial9 = [
-    "std",
-    "dep:dial9-tokio-telemetry",
-    "dep:dial9-trace-format",
-    "rama-core/dial9",
-]
+# [dial9]: https://github.com/dial9-rs/dial9
+dial9 = ["std", "dep:dial9", "dep:dial9-trace-format", "rama-core/dial9"]
 
 [dependencies]
 ahash = { workspace = true, optional = true }
+arc-swap = { workspace = true, optional = true }
+# no workspace inherit: default features (std) must stay off for no_std builds
+base64 = { version = "0.23", default-features = false, features = ["alloc"], optional = true }
 bitflags = { workspace = true }
 const_format = { workspace = true }
 csv = { workspace = true, optional = true }
-dial9-tokio-telemetry = { workspace = true, optional = true }
+dial9 = { workspace = true, optional = true }
 dial9-trace-format = { workspace = true, optional = true }
 idna = { workspace = true, optional = true }
 ipnet = { workspace = true, features = ["serde"] }
@@ -85,9 +90,10 @@ itoa = { workspace = true }
 # no workspace inherit: default features (std) must stay off for no_std builds
 memchr = { version = "2.8", default-features = false }
 memmap2 = { workspace = true, optional = true }
+mime = { workspace = true, optional = true }
+moka = { workspace = true, features = ["sync"], optional = true }
 parking_lot = { workspace = true, optional = true }
-# no workspace inherit: default features (std) must stay off for no_std builds
-percent-encoding = { version = "2.3", default-features = false, features = ["alloc"] }
+percent-encoding = { workspace = true, default-features = false, features = ["alloc"] }
 pin-project-lite = { workspace = true }
 psl = { workspace = true }
 radix_trie = { workspace = true, optional = true }
@@ -97,15 +103,22 @@ rama-utils = { workspace = true }
 serde = { workspace = true, features = ["derive"] }
 serde_html_form = { workspace = true, optional = true }
 socket2 = { workspace = true, features = ["all"], optional = true }
-tokio = { workspace = true, features = ["macros", "fs", "io-std", "io-util", "net", "sync", "time"], optional = true }
+tokio = { workspace = true, features = ["macros", "fs", "io-std", "io-util", "net", "process", "sync", "time"], optional = true }
 tokio-util = { workspace = true, optional = true }
 venndb = { workspace = true, optional = true }
 
-[target.'cfg(target_os = "linux")'.dependencies]
+[target.'cfg(target_family = "unix")'.dependencies]
 libc = { workspace = true, optional = true }
 
+[target.'cfg(target_os = "android")'.dependencies]
+jni = { workspace = true, optional = true }
+ndk-context = { workspace = true, optional = true }
+
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_Networking_WinSock", "Win32_System_IO"], optional = true }
+windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_NetworkManagement_IpHelper", "Win32_NetworkManagement_Ndis", "Win32_Networking_WinHttp", "Win32_Networking_WinSock", "Win32_System_IO", "Win32_System_Registry", "Win32_System_Threading"], optional = true }
+
+[target.'cfg(target_vendor = "apple")'.dependencies]
+core-foundation = { workspace = true, optional = true }
 
 [dev-dependencies]
 ahash = { workspace = true }
@@ -113,7 +126,6 @@ itertools = { workspace = true }
 quickcheck = { workspace = true }
 quickcheck_macros = { workspace = true }
 serde_json = { workspace = true }
-tempfile = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-test = { workspace = true }
 

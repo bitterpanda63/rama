@@ -1,4 +1,19 @@
-//! This example shows how one can begin with creating a MITM proxy.
+//! Low-level Rustls MITM example kept to demonstrate manual TLS termination.
+//!
+//! This example intentionally uses the split/lazy upgrade path as a Rustls
+//! compatibility demonstration. The CONNECT authority is already known, so
+//! laziness is not required for target selection. Rama does not yet provide a
+//! paired Rustls ingress/egress `TlsMitmRelay` that can carry a socket
+//! established during CONNECT through both TLS sides. This example therefore
+//! acknowledges CONNECT first, terminates ingress TLS, and lets
+//! [`EasyHttpWebClient`] connect from each decrypted HTTP request.
+//!
+//! Consequently, a successful CONNECT response here does not prove egress
+//! reachability, and later requests are not guaranteed to use one connection
+//! established for the CONNECT target. Prefer `http_mitm_proxy_boring` as the
+//! starting point for a new MITM proxy: it uses the Relay/Peek stack and keeps
+//! one egress connection from the proxy handshake through the application
+//! relay.
 //!
 //! Note that this MITM proxy is not production ready, and is only meant
 //! to show you how one might start. You might want to address the following:
@@ -10,7 +25,8 @@
 //!   even though it might be better to be able to map bidirectionaly between http versions
 //! - ... and much more
 //!
-//! That said for basic usage it does work and should at least give you an idea on how to get started.
+//! This manual variant works for basic usage, but is not the recommended proxy
+//! architecture and should not be copied merely to add Rustls termination.
 //!
 //! It combines concepts that can seen in action separately in the following examples:
 //!
@@ -59,7 +75,7 @@ use rama::{
             remove_header::{RemoveRequestHeaderLayer, RemoveResponseHeaderLayer},
             required_header::AddRequiredRequestHeadersLayer,
             trace::TraceLayer,
-            upgrade::{DefaultHttpProxyConnectReplyService, UpgradeLayer, Upgraded},
+            upgrade::{LazyHttpProxyConnectReplyService, UpgradeLayer, Upgraded},
         },
         matcher::MethodMatcher,
         server::HttpServer,
@@ -77,7 +93,7 @@ use rama::{
     tls::KeyLogIntent,
     tls::client::{ServerVerifyMode, TlsClientConfig},
     tls::rustls::server::TlsAcceptorLayer,
-    tls::server::{SelfSignedData, TlsServerConfig},
+    tls::server::{GeneratedServerAuthConfig, TlsServerConfig},
     utils::octets::mib,
 };
 
@@ -124,10 +140,13 @@ async fn main() -> Result<(), BoxError> {
                 // See [`ProxyAuthLayer::with_labels`] for more information,
                 // e.g. can also be used to extract upstream proxy filters
                 ProxyAuthLayer::new(basic!("john", "secret")),
-                UpgradeLayer::new(
+                // Rustls compatibility path: no paired Rustls relay can consume
+                // a pre-established egress socket yet. The handler terminates
+                // ingress TLS; EasyHttpWebClient connects after decryption.
+                UpgradeLayer::new_with_services(
                     exec,
                     MethodMatcher::CONNECT,
-                    DefaultHttpProxyConnectReplyService::new(),
+                    LazyHttpProxyConnectReplyService::new(),
                     service_fn(http_connect_proxy),
                 ),
             )
@@ -177,17 +196,17 @@ async fn http_connect_proxy(upgraded: Upgraded) -> Result<(), BoxError> {
 fn new_http_mitm_proxy() -> impl Service<Request, Output = Response, Error = Infallible> + Clone {
     Arc::new(
         (
+            RemoveRequestHeaderLayer::hop_by_hop(),
             MapResponseBodyLayer::new_boxed_streaming_body(),
             TraceLayer::new_for_http(),
             ConsumeErrLayer::default(),
-            RemoveResponseHeaderLayer::hop_by_hop(),
-            RemoveRequestHeaderLayer::hop_by_hop(),
             // A MITM proxy relays whatever `Accept-Encoding` the client sends; it must not turn an
             // unsatisfiable negotiation into its own 406, so opt out of that enforcement.
             CompressionLayer::new()
                 .with_compress_predicate(MirrorDecompressed::new())
                 .with_enforce_not_acceptable(false),
             AddRequiredRequestHeadersLayer::new(),
+            RemoveResponseHeaderLayer::hop_by_hop(),
         )
             .into_layer(service_fn(http_mitm_proxy)),
     )
@@ -211,6 +230,7 @@ async fn http_mitm_proxy(req: Request) -> Result<Response, Infallible> {
         .with_proxy_support()
         .with_tls_support_using_rustls_and_default_http_version(tls_config, Version::HTTP_11)
         .with_default_http_connector(executor)
+        .without_connection_pool()
         .build_client();
 
     let client = (
@@ -240,10 +260,7 @@ async fn http_mitm_proxy(req: Request) -> Result<Response, Infallible> {
 // load it in from memory/file, so that your clients can install the certificate for trust.
 fn new_mitm_tls_service_data() -> TlsServerConfig {
     TlsServerConfig::new()
-        .try_with_self_signed(SelfSignedData {
-            organisation_name: Some("Example Server Acceptor".to_owned()),
-            ..Default::default()
-        })
+        .try_with_generated_server_auth(GeneratedServerAuthConfig::default())
         .expect("self-signed")
         .with_alpn_http_auto()
         .with_keylog(KeyLogIntent::Environment)

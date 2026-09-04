@@ -47,11 +47,20 @@ pub use infinite::InfiniteReader;
 mod on_drop;
 pub use on_drop::OnDropBody;
 
+mod incomplete;
+pub use incomplete::OnIncompleteBody;
+
 mod guarded;
 pub use guarded::GuardedBody;
 
 mod optional;
 pub use optional::OptionalBody;
+
+mod capture;
+pub use capture::{
+    BodyCaptureEvent, BodyCaptureSink, BufferedBodyCapture, CaptureBody, CaptureCanceled,
+    CaptureHandle, CaptureLimit, CaptureOutcome, CapturedBody,
+};
 
 // Implementations copied over from http-body but addapted to work with our Requests/Response types
 
@@ -163,6 +172,20 @@ impl Body {
         })
     }
 
+    /// Create a new `Body` from a stream of data and trailer frames.
+    ///
+    /// Unlike [`from_stream`](Self::from_stream), this preserves HTTP
+    /// trailer frames produced by the stream.
+    pub fn from_frame_stream<S, E>(stream: S) -> Self
+    where
+        S: TryStream<Ok = Frame<Bytes>, Error = E> + Send + 'static,
+        E: Into<BoxError> + 'static,
+    {
+        Self::new(FrameStreamBody {
+            stream: SyncWrapper::new(stream),
+        })
+    }
+
     /// Create a new [`Body`] from a [`Stream`] with a maximum size limit.
     pub fn limited(self, limit: usize) -> Self {
         Self::new(util::Limited::new(self.0, limit))
@@ -178,6 +201,51 @@ impl Body {
         F: FnOnce() + Send + Sync + 'static,
     {
         Self::new(OnDropBody::new(self.0, on_drop))
+    }
+
+    /// Wrap this body so that `on_incomplete` is called as soon as it is known
+    /// the body will not complete: an error frame is observed, or the body is
+    /// dropped before end-of-stream.
+    ///
+    /// The closure fires at most once. See [`OnIncompleteBody`] for how this
+    /// differs from [`Self::on_drop`].
+    pub fn on_incomplete<F>(self, on_incomplete: F) -> Self
+    where
+        F: FnOnce() + Send + Sync + 'static,
+    {
+        Self::new(OnIncompleteBody::new(self.0, on_incomplete))
+    }
+
+    /// Forward this body while asynchronously sending owned frame copies to a sink.
+    pub fn capture<S>(self, sink: S) -> Self
+    where
+        S: BodyCaptureSink,
+    {
+        Self::new(CaptureBody::new(self.0, sink))
+    }
+
+    /// Forward this body while retaining a bounded or unlimited copy in memory.
+    ///
+    /// The returned handle resolves exactly once after the forwarding body
+    /// completes, errors, or is dropped:
+    ///
+    /// ```
+    /// use rama_http_types::{Body, CaptureLimit, CaptureOutcome, body::util::BodyExt as _};
+    ///
+    /// # #[tokio::main]
+    /// # async fn main() {
+    /// let (body, capture) = Body::from("hello").capture_buffered(CaptureLimit::max_bytes(1024));
+    /// body.collect().await.unwrap();
+    ///
+    /// let captured = capture.wait().await.unwrap();
+    /// assert_eq!(captured.bytes(), "hello");
+    /// assert_eq!(captured.outcome(), CaptureOutcome::Complete);
+    /// assert!(!captured.is_truncated());
+    /// # }
+    /// ```
+    pub fn capture_buffered(self, limit: CaptureLimit) -> (Self, CaptureHandle) {
+        let (body, handle) = CaptureBody::buffered(self.0, limit);
+        (Self::new(body), handle)
     }
 
     /// Attach a headermap as trailer headers to this body.
@@ -384,6 +452,34 @@ pin_project! {
     }
 }
 
+pin_project! {
+    struct FrameStreamBody<S> {
+        #[pin]
+        stream: SyncWrapper<S>,
+    }
+}
+
+impl<S, E> StreamingBody for FrameStreamBody<S>
+where
+    S: TryStream<Ok = Frame<Bytes>, Error = E>,
+    E: Into<BoxError>,
+{
+    type Data = Bytes;
+    type Error = BoxError;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+        let stream = self.project().stream.get_pin_mut();
+        match rama_core::futures::ready!(stream.try_poll_next(cx)) {
+            Some(Ok(frame)) => Poll::Ready(Some(Ok(frame))),
+            Some(Err(error)) => Poll::Ready(Some(Err(error.into()))),
+            None => Poll::Ready(None),
+        }
+    }
+}
+
 impl<S> StreamingBody for StreamBody<S>
 where
     S: TryStream<Ok: Into<Bytes>, Error: Into<BoxError>>,
@@ -408,4 +504,49 @@ where
 fn test_try_downcast() {
     assert_eq!(try_downcast::<i32, _>(5_u32), Err(5_u32));
     assert_eq!(try_downcast::<i32, _>(5_i32), Ok(5_i32));
+}
+
+#[tokio::test]
+async fn capture_convenience_forwards_and_observes_body() {
+    let (sink, mut events) = tokio::sync::mpsc::unbounded_channel();
+    let forwarded = Body::from("captured").capture(sink);
+
+    assert_eq!(
+        forwarded.collect().await.unwrap().to_bytes(),
+        Bytes::from_static(b"captured")
+    );
+    let BodyCaptureEvent::Frame(frame) = events.recv().await.unwrap() else {
+        panic!("the first capture event must contain the data frame");
+    };
+    assert_eq!(frame.into_data().unwrap(), Bytes::from_static(b"captured"));
+    assert!(matches!(
+        events.recv().await,
+        Some(BodyCaptureEvent::End(CaptureOutcome::Complete))
+    ));
+}
+
+#[tokio::test]
+async fn frame_stream_constructor_preserves_trailers() {
+    let mut trailers = crate::HeaderMap::new();
+    trailers.insert("x-end", "yes".parse().unwrap());
+    let stream = rama_core::futures::stream::iter([
+        Ok::<_, std::convert::Infallible>(Frame::data(Bytes::from_static(b"data"))),
+        Ok(Frame::trailers(trailers.clone())),
+    ]);
+    let mut body = Body::from_frame_stream(stream);
+
+    assert_eq!(
+        body.frame().await.unwrap().unwrap().into_data().unwrap(),
+        "data"
+    );
+    assert_eq!(
+        body.frame()
+            .await
+            .unwrap()
+            .unwrap()
+            .into_trailers()
+            .unwrap(),
+        trailers,
+    );
+    assert!(body.frame().await.is_none());
 }

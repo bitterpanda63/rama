@@ -27,6 +27,16 @@ enum ProtocolKind {
     Http,
     /// The `https` protocol.
     Https,
+    /// The `icap` protocol.
+    ///
+    /// <https://datatracker.ietf.org/doc/html/rfc3507>
+    Icap,
+    /// Direct TLS transport for ICAP, conventionally spelled `icaps`.
+    ///
+    /// RFC 3507 defines TLS negotiation through Upgrade rather than a secure
+    /// URI scheme. Direct TLS and the `icaps` spelling are deployment
+    /// conventions, not IANA-registered protocol elements.
+    Icaps,
     /// The `ws` protocol.
     ///
     /// (WebSocket over HTTP)
@@ -55,6 +65,13 @@ enum ProtocolKind {
     ///
     /// Has no default port — `file:` is not a network protocol.
     File,
+    /// The `data` protocol. The URI carries its own payload
+    /// (`data:[<mediatype>][;base64],<data>`); consumers decode it in
+    /// place instead of dialing or opening anything. Defined by
+    /// [RFC 2397](https://datatracker.ietf.org/doc/html/rfc2397).
+    ///
+    /// Has no default port — `data:` is not a network protocol.
+    Data,
     /// Custom protocol.
     Custom(SmolStr),
 }
@@ -64,6 +81,14 @@ impl Protocol {
     pub const HTTP_SCHEME: &str = "http";
     /// `HTTP` protocol default port
     pub const HTTP_DEFAULT_PORT: u16 = 80;
+    /// Common alternate `HTTP` protocol port.
+    pub const HTTP_ALT_PORT: u16 = 8080;
+    /// Common default port for an HTTP proxy address without an explicit port.
+    ///
+    /// This follows the long-standing curl proxy-address convention. It is
+    /// distinct from [`HTTP_DEFAULT_PORT`][Self::HTTP_DEFAULT_PORT], which is
+    /// the default port for an HTTP origin server.
+    pub const HTTP_PROXY_DEFAULT_PORT: u16 = 1080;
     /// `HTTP` protocol.
     pub const HTTP: Self = Self(ProtocolKind::Http);
 
@@ -71,8 +96,28 @@ impl Protocol {
     pub const HTTPS_SCHEME: &str = "https";
     /// `HTTPS` protocol default port
     pub const HTTPS_DEFAULT_PORT: u16 = 443;
+    /// Common alternate `HTTPS` protocol port.
+    pub const HTTPS_ALT_PORT: u16 = 8443;
     /// `HTTPS` protocol.
     pub const HTTPS: Self = Self(ProtocolKind::Https);
+
+    /// `ICAP` protocol scheme.
+    pub const ICAP_SCHEME: &str = "icap";
+    /// `ICAP` protocol default port.
+    pub const ICAP_DEFAULT_PORT: u16 = 1344;
+    /// `ICAP` protocol.
+    pub const ICAP: Self = Self(ProtocolKind::Icap);
+
+    /// Direct TLS `ICAP` protocol scheme.
+    ///
+    /// This is a deployed convention and is not registered by IANA.
+    pub const ICAPS_SCHEME: &str = "icaps";
+    /// Conventional direct TLS `ICAP` protocol default port.
+    ///
+    /// Port 11344 is widely deployed but is not assigned by RFC 3507.
+    pub const ICAPS_DEFAULT_PORT: u16 = 11344;
+    /// Direct TLS `ICAP` protocol.
+    pub const ICAPS: Self = Self(ProtocolKind::Icaps);
 
     /// `WS` protocol scheme
     pub const WS_SCHEME: &str = "ws";
@@ -110,6 +155,13 @@ impl Protocol {
     /// rather than dialing a network endpoint.
     pub const FILE: Self = Self(ProtocolKind::File);
 
+    /// `DATA` protocol scheme. RFC 2397 — `data:[<mediatype>][;base64],<data>`.
+    pub const DATA_SCHEME: &str = "data";
+    /// The `data` protocol. Self-contained URI scheme: the URI itself
+    /// carries the payload, which consumers decode in place rather
+    /// than dialing a network endpoint or opening a file.
+    pub const DATA: Self = Self(ProtocolKind::Data);
+
     /// Creates a Protocol from a str a compile time.
     ///
     /// This function requires the static string to be a valid protocol.
@@ -134,6 +186,10 @@ impl Protocol {
             ProtocolKind::Https
         } else if eq_ignore_ascii_case!(s, Self::HTTP_SCHEME) {
             ProtocolKind::Http
+        } else if eq_ignore_ascii_case!(s, Self::ICAP_SCHEME) {
+            ProtocolKind::Icap
+        } else if eq_ignore_ascii_case!(s, Self::ICAPS_SCHEME) {
+            ProtocolKind::Icaps
         } else if eq_ignore_ascii_case!(s, Self::SOCKS5_SCHEME) {
             ProtocolKind::Socks5
         } else if eq_ignore_ascii_case!(s, Self::SOCKS5H_SCHEME) {
@@ -144,6 +200,8 @@ impl Protocol {
             ProtocolKind::Wss
         } else if eq_ignore_ascii_case!(s, Self::FILE_SCHEME) {
             ProtocolKind::File
+        } else if eq_ignore_ascii_case!(s, Self::DATA_SCHEME) {
+            ProtocolKind::Data
         } else if validate_scheme_str(s) {
             ProtocolKind::Custom(SmolStr::new_static(s))
         } else {
@@ -158,9 +216,12 @@ impl Protocol {
             ProtocolKind::Http | ProtocolKind::Https => true,
             ProtocolKind::Ws
             | ProtocolKind::Wss
+            | ProtocolKind::Icap
+            | ProtocolKind::Icaps
             | ProtocolKind::Socks5
             | ProtocolKind::Socks5h
             | ProtocolKind::File
+            | ProtocolKind::Data
             | ProtocolKind::Custom(_) => false,
         }
     }
@@ -172,9 +233,30 @@ impl Protocol {
             ProtocolKind::Ws | ProtocolKind::Wss => true,
             ProtocolKind::Http
             | ProtocolKind::Https
+            | ProtocolKind::Icap
+            | ProtocolKind::Icaps
             | ProtocolKind::Socks5
             | ProtocolKind::Socks5h
             | ProtocolKind::File
+            | ProtocolKind::Data
+            | ProtocolKind::Custom(_) => false,
+        }
+    }
+
+    /// Returns `true` for application protocols implemented on top of HTTP.
+    ///
+    /// The HTTP version and transport are orthogonal to this classification:
+    /// HTTP/3 is still HTTP-based even though it runs over QUIC.
+    #[must_use]
+    pub fn is_http_based(&self) -> bool {
+        match &self.0 {
+            ProtocolKind::Http | ProtocolKind::Https | ProtocolKind::Ws | ProtocolKind::Wss => true,
+            ProtocolKind::Icap
+            | ProtocolKind::Icaps
+            | ProtocolKind::Socks5
+            | ProtocolKind::Socks5h
+            | ProtocolKind::File
+            | ProtocolKind::Data
             | ProtocolKind::Custom(_) => false,
         }
     }
@@ -186,9 +268,29 @@ impl Protocol {
             ProtocolKind::Socks5 | ProtocolKind::Socks5h => true,
             ProtocolKind::Http
             | ProtocolKind::Https
+            | ProtocolKind::Icap
+            | ProtocolKind::Icaps
             | ProtocolKind::Ws
             | ProtocolKind::Wss
             | ProtocolKind::File
+            | ProtocolKind::Data
+            | ProtocolKind::Custom(_) => false,
+        }
+    }
+
+    /// Returns `true` if this protocol is ICAP.
+    #[must_use]
+    pub fn is_icap(&self) -> bool {
+        match &self.0 {
+            ProtocolKind::Icap | ProtocolKind::Icaps => true,
+            ProtocolKind::Http
+            | ProtocolKind::Https
+            | ProtocolKind::Ws
+            | ProtocolKind::Wss
+            | ProtocolKind::Socks5
+            | ProtocolKind::Socks5h
+            | ProtocolKind::File
+            | ProtocolKind::Data
             | ProtocolKind::Custom(_) => false,
         }
     }
@@ -197,24 +299,27 @@ impl Protocol {
     #[must_use]
     pub fn is_secure(&self) -> bool {
         match &self.0 {
-            ProtocolKind::Https | ProtocolKind::Wss => true,
+            ProtocolKind::Https | ProtocolKind::Wss | ProtocolKind::Icaps => true,
             ProtocolKind::Ws
             | ProtocolKind::Http
+            | ProtocolKind::Icap
             | ProtocolKind::Socks5
             | ProtocolKind::Socks5h
             | ProtocolKind::File
+            | ProtocolKind::Data
             | ProtocolKind::Custom(_) => false,
         }
     }
 
     /// Returns the default port for this [`Protocol`].
     ///
-    /// Registered defaults: `http=80`, `https=443`, `ws=80`, `wss=443`,
-    /// `socks5=1080`, `socks5h=1080`. Other schemes (`ftp:21`, `ssh:22`,
-    /// `ldap:389`, …) return `None` — `Protocol`'s scope is the
-    /// web-protocol set rama actively models.
+    /// Modeled defaults: `http=80`, `https=443`, `ws=80`, `wss=443`,
+    /// `socks5=1080`, `socks5h=1080`, `icap=1344`, and the conventional
+    /// direct-TLS `icaps=11344`. Other schemes (`ftp:21`, `ssh:22`,
+    /// `ldap:389`, …) return `None` — `Protocol`'s scope is the web-protocol
+    /// set rama actively models.
     /// [`crate::uri::Uri::canonicalize`] only drops ports that match a
-    /// registered default, so `ftp://host:21/` keeps its `:21`. This
+    /// modeled default, so `ftp://host:21/` keeps its `:21`. This
     /// diverges from WHATWG-URL (which strips `ftp:21`).
     ///
     /// The set of supported protocols grows with the needs that justify them.
@@ -225,10 +330,35 @@ impl Protocol {
             ProtocolKind::Wss => Some(Self::WSS_DEFAULT_PORT),
             ProtocolKind::Http => Some(Self::HTTP_DEFAULT_PORT),
             ProtocolKind::Ws => Some(Self::WS_DEFAULT_PORT),
+            ProtocolKind::Icap => Some(Self::ICAP_DEFAULT_PORT),
+            ProtocolKind::Icaps => Some(Self::ICAPS_DEFAULT_PORT),
             ProtocolKind::Socks5 => Some(Self::SOCKS5_DEFAULT_PORT),
             ProtocolKind::Socks5h => Some(Self::SOCKS5H_DEFAULT_PORT),
-            // `file:` is not a network protocol — no default port.
-            ProtocolKind::File | ProtocolKind::Custom(_) => None,
+            // `file:`/`data:` are not network protocols — no default port.
+            ProtocolKind::File | ProtocolKind::Data | ProtocolKind::Custom(_) => None,
+        }
+    }
+
+    /// Returns the default port when this protocol is used to reach a proxy.
+    ///
+    /// An HTTP proxy URL follows the long-standing curl convention of port
+    /// 1080 when its authority omits a port. HTTPS, SOCKS5, and SOCKS5H use
+    /// their protocol defaults. Other protocols do not have an implicit proxy
+    /// port.
+    #[must_use]
+    pub fn proxy_default_port(&self) -> Option<u16> {
+        match &self.0 {
+            ProtocolKind::Http => Some(Self::HTTP_PROXY_DEFAULT_PORT),
+            ProtocolKind::Https => Some(Self::HTTPS_DEFAULT_PORT),
+            ProtocolKind::Socks5 => Some(Self::SOCKS5_DEFAULT_PORT),
+            ProtocolKind::Socks5h => Some(Self::SOCKS5H_DEFAULT_PORT),
+            ProtocolKind::Ws
+            | ProtocolKind::Wss
+            | ProtocolKind::Icap
+            | ProtocolKind::Icaps
+            | ProtocolKind::File
+            | ProtocolKind::Data
+            | ProtocolKind::Custom(_) => None,
         }
     }
 
@@ -238,12 +368,34 @@ impl Protocol {
         match &self.0 {
             ProtocolKind::Http => Self::HTTP_SCHEME,
             ProtocolKind::Https => Self::HTTPS_SCHEME,
+            ProtocolKind::Icap => Self::ICAP_SCHEME,
+            ProtocolKind::Icaps => Self::ICAPS_SCHEME,
             ProtocolKind::Ws => Self::WS_SCHEME,
             ProtocolKind::Wss => Self::WSS_SCHEME,
             ProtocolKind::Socks5 => Self::SOCKS5_SCHEME,
             ProtocolKind::Socks5h => Self::SOCKS5H_SCHEME,
             ProtocolKind::File => Self::FILE_SCHEME,
+            ProtocolKind::Data => Self::DATA_SCHEME,
             ProtocolKind::Custom(s) => s.as_ref(),
+        }
+    }
+
+    /// Return the RFC 3986 canonical presentation of this scheme.
+    ///
+    /// Known protocols are stored canonically already. A custom scheme is
+    /// ASCII-lowercased, allocating only when its presentation contains an
+    /// uppercase letter.
+    #[must_use]
+    pub fn canonicalize(self) -> Self {
+        match self.0 {
+            ProtocolKind::Custom(scheme)
+                if scheme.bytes().any(|byte| byte.is_ascii_uppercase()) =>
+            {
+                Self(ProtocolKind::Custom(SmolStr::new(
+                    scheme.to_ascii_lowercase(),
+                )))
+            }
+            _ => self,
         }
     }
 }
@@ -261,6 +413,10 @@ fn try_to_convert_str_to_non_custom_protocol(
             ProtocolKind::Https
         } else if eq_ignore_ascii_case!(s, Protocol::HTTP_SCHEME) {
             ProtocolKind::Http
+        } else if eq_ignore_ascii_case!(s, Protocol::ICAP_SCHEME) {
+            ProtocolKind::Icap
+        } else if eq_ignore_ascii_case!(s, Protocol::ICAPS_SCHEME) {
+            ProtocolKind::Icaps
         } else if eq_ignore_ascii_case!(s, Protocol::SOCKS5_SCHEME) {
             ProtocolKind::Socks5
         } else if eq_ignore_ascii_case!(s, Protocol::SOCKS5H_SCHEME) {
@@ -271,6 +427,8 @@ fn try_to_convert_str_to_non_custom_protocol(
             ProtocolKind::Wss
         } else if eq_ignore_ascii_case!(s, Protocol::FILE_SCHEME) {
             ProtocolKind::File
+        } else if eq_ignore_ascii_case!(s, Protocol::DATA_SCHEME) {
+            ProtocolKind::Data
         } else if validate_scheme_str(s) {
             return Ok(None);
         } else {
@@ -323,11 +481,14 @@ impl PartialEq<str> for Protocol {
         match &self.0 {
             ProtocolKind::Https => other.eq_ignore_ascii_case(Self::HTTPS_SCHEME),
             ProtocolKind::Http => other.eq_ignore_ascii_case(Self::HTTP_SCHEME) || other.is_empty(),
+            ProtocolKind::Icap => other.eq_ignore_ascii_case(Self::ICAP_SCHEME),
+            ProtocolKind::Icaps => other.eq_ignore_ascii_case(Self::ICAPS_SCHEME),
             ProtocolKind::Socks5 => other.eq_ignore_ascii_case(Self::SOCKS5_SCHEME),
             ProtocolKind::Socks5h => other.eq_ignore_ascii_case(Self::SOCKS5H_SCHEME),
             ProtocolKind::Ws => other.eq_ignore_ascii_case(Self::WS_SCHEME),
             ProtocolKind::Wss => other.eq_ignore_ascii_case(Self::WSS_SCHEME),
             ProtocolKind::File => other.eq_ignore_ascii_case(Self::FILE_SCHEME),
+            ProtocolKind::Data => other.eq_ignore_ascii_case(Self::DATA_SCHEME),
             ProtocolKind::Custom(s) => other.eq_ignore_ascii_case(s),
         }
     }
@@ -474,11 +635,91 @@ mod tests {
     fn test_from_str() {
         assert_eq!("http".parse(), Ok(Protocol::HTTP));
         assert_eq!("https".parse(), Ok(Protocol::HTTPS));
+        assert_eq!("icap".parse(), Ok(Protocol::ICAP));
+        assert_eq!("icaps".parse(), Ok(Protocol::ICAPS));
         assert_eq!("ws".parse(), Ok(Protocol::WS));
         assert_eq!("wss".parse(), Ok(Protocol::WSS));
         assert_eq!("socks5".parse(), Ok(Protocol::SOCKS5));
         assert_eq!("socks5h".parse(), Ok(Protocol::SOCKS5H));
+        assert_eq!("file".parse(), Ok(Protocol::FILE));
+        assert_eq!("data".parse(), Ok(Protocol::DATA));
         assert_eq!("custom".parse(), Ok(Protocol::from_static("custom")));
+    }
+
+    #[test]
+    fn canonicalize_lowercases_custom_schemes() {
+        assert_eq!(
+            Protocol::from_static("CuStOm").canonicalize().as_str(),
+            "custom"
+        );
+        assert_eq!(Protocol::HTTPS.canonicalize(), Protocol::HTTPS);
+    }
+
+    #[test]
+    fn icap_protocol() {
+        assert_eq!(Protocol::from_static("ICAP"), Protocol::ICAP);
+        assert_eq!("ICAP".parse(), Ok(Protocol::ICAP));
+        assert_eq!(Protocol::ICAP.as_str(), Protocol::ICAP_SCHEME);
+        assert_eq!(
+            Protocol::ICAP.default_port(),
+            Some(Protocol::ICAP_DEFAULT_PORT)
+        );
+        assert!(Protocol::ICAP.is_icap());
+        assert!(!Protocol::ICAP.is_http());
+        assert!(!Protocol::ICAP.is_ws());
+        assert!(!Protocol::ICAP.is_socks5());
+        assert!(!Protocol::ICAP.is_secure());
+
+        assert_eq!(Protocol::from_static("ICAPS"), Protocol::ICAPS);
+        assert_eq!("ICAPS".parse(), Ok(Protocol::ICAPS));
+        assert_eq!(Protocol::ICAPS.as_str(), Protocol::ICAPS_SCHEME);
+        assert_eq!(
+            Protocol::ICAPS.default_port(),
+            Some(Protocol::ICAPS_DEFAULT_PORT)
+        );
+        assert!(Protocol::ICAPS.is_icap());
+        assert!(!Protocol::ICAPS.is_http());
+        assert!(!Protocol::ICAPS.is_ws());
+        assert!(!Protocol::ICAPS.is_socks5());
+        assert!(Protocol::ICAPS.is_secure());
+    }
+
+    #[test]
+    fn test_non_network_schemes() {
+        for (protocol, scheme) in [
+            (Protocol::FILE, Protocol::FILE_SCHEME),
+            (Protocol::DATA, Protocol::DATA_SCHEME),
+        ] {
+            // guards the const ladder against the runtime ladder drifting apart
+            assert_eq!(Protocol::from_static(scheme), protocol);
+            assert_eq!(scheme.parse(), Ok(protocol.clone()));
+            assert_eq!(scheme.to_uppercase().parse(), Ok(protocol.clone()));
+            assert_eq!(protocol.as_str(), scheme);
+            assert_eq!(protocol.default_port(), None);
+            assert!(!protocol.is_http());
+            assert!(!protocol.is_ws());
+            assert!(!protocol.is_socks5());
+            assert!(!protocol.is_secure());
+        }
+    }
+
+    #[test]
+    fn proxy_default_ports_are_transport_specific() {
+        for (protocol, expected) in [
+            (Protocol::HTTP, Some(Protocol::HTTP_PROXY_DEFAULT_PORT)),
+            (Protocol::HTTPS, Some(Protocol::HTTPS_DEFAULT_PORT)),
+            (Protocol::SOCKS5, Some(Protocol::SOCKS5_DEFAULT_PORT)),
+            (Protocol::SOCKS5H, Some(Protocol::SOCKS5H_DEFAULT_PORT)),
+            (Protocol::WS, None),
+            (Protocol::WSS, None),
+            (Protocol::ICAP, None),
+            (Protocol::ICAPS, None),
+            (Protocol::FILE, None),
+            (Protocol::DATA, None),
+            (Protocol::from_static("custom"), None),
+        ] {
+            assert_eq!(protocol.proxy_default_port(), expected, "{protocol}");
+        }
     }
 
     #[test]
@@ -527,9 +768,31 @@ mod tests {
         assert!(Protocol::HTTPS.is_secure());
         assert!(!Protocol::SOCKS5.is_secure());
         assert!(!Protocol::SOCKS5H.is_secure());
+        assert!(!Protocol::ICAP.is_secure());
+        assert!(Protocol::ICAPS.is_secure());
         assert!(!Protocol::WS.is_secure());
         assert!(Protocol::WSS.is_secure());
+        assert!(!Protocol::FILE.is_secure());
+        assert!(!Protocol::DATA.is_secure());
         assert!(!Protocol::from_static("custom").is_secure());
+    }
+
+    #[test]
+    fn test_scheme_is_http_based() {
+        for protocol in [Protocol::HTTP, Protocol::HTTPS, Protocol::WS, Protocol::WSS] {
+            assert!(protocol.is_http_based(), "protocol: {protocol}");
+        }
+        for protocol in [
+            Protocol::ICAP,
+            Protocol::ICAPS,
+            Protocol::SOCKS5,
+            Protocol::SOCKS5H,
+            Protocol::FILE,
+            Protocol::DATA,
+            Protocol::from_static("custom"),
+        ] {
+            assert!(!protocol.is_http_based(), "protocol: {protocol}");
+        }
     }
 
     #[test]
@@ -540,6 +803,8 @@ mod tests {
             ("https://example.com", Some((Some(Protocol::HTTPS), 8))),
             ("ws://example.com", Some((Some(Protocol::WS), 5))),
             ("wss://example.com", Some((Some(Protocol::WSS), 6))),
+            ("icap://example.com", Some((Some(Protocol::ICAP), 7))),
+            ("icaps://example.com", Some((Some(Protocol::ICAPS), 8))),
             ("socks5://example.com", Some((Some(Protocol::SOCKS5), 9))),
             ("socks5h://example.com", Some((Some(Protocol::SOCKS5H), 10))),
             (

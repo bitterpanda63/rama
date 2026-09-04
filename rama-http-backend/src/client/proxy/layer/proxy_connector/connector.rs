@@ -79,11 +79,7 @@ impl InnerHttpProxyConnector {
         let response = match self.req.version() {
             Version::HTTP_10 | Version::HTTP_11 => Self::handshake_h1(self.req, stream).await?,
             Version::HTTP_2 => Self::handshake_h2(self.req, stream).await?,
-            version => {
-                return Err(HttpProxyError::Other(format!(
-                    "invalid http version: {version:?}",
-                )));
-            }
+            version => return Err(HttpProxyError::InvalidVersion(version)),
         };
 
         match response.status() {
@@ -96,9 +92,10 @@ impl InnerHttpProxyConnector {
                 .map_err(|err| HttpProxyError::Transport(BoxError::from(err))),
             StatusCode::PROXY_AUTHENTICATION_REQUIRED => Err(HttpProxyError::AuthRequired),
             StatusCode::SERVICE_UNAVAILABLE => Err(HttpProxyError::Unavailable),
-            status => Err(HttpProxyError::Other(format!(
-                "invalid http proxy conn handshake: status={status}",
-            ))),
+            StatusCode::BAD_GATEWAY | StatusCode::GATEWAY_TIMEOUT => {
+                Err(HttpProxyError::UpstreamFailure(response.status()))
+            }
+            status => Err(HttpProxyError::Rejected(status)),
         }
     }
 
@@ -112,7 +109,7 @@ impl InnerHttpProxyConnector {
             .await
             .map_err(|err| HttpProxyError::Transport(err.into()))?;
 
-        tokio::spawn(async move {
+        rama_core::rt::spawn(async move {
             if let Err(err) = conn.with_upgrades().await {
                 tracing::debug!("http upgrade proxy client conn failed: {err:?}");
             }
@@ -132,7 +129,7 @@ impl InnerHttpProxyConnector {
             .await
             .map_err(|err| HttpProxyError::Transport(err.into()))?;
 
-        tokio::spawn(async move {
+        rama_core::rt::spawn(async move {
             if let Err(err) = conn.await {
                 tracing::debug!("http2 proxy client conn failed: {err:?}");
             }

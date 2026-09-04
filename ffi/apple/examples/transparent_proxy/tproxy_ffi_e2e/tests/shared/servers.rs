@@ -15,7 +15,7 @@ use rama::{
             map_response_body::MapResponseBodyLayer,
             remove_header::{RemoveRequestHeaderLayer, RemoveResponseHeaderLayer},
             upgrade::{
-                DefaultHttpProxyConnectReplyService, UpgradeLayer, mitm::HttpUpgradeMitmRelayLayer,
+                LazyHttpProxyConnectReplyService, UpgradeLayer, mitm::HttpUpgradeMitmRelayLayer,
             },
         },
         matcher::HttpMatcher,
@@ -38,7 +38,7 @@ use rama::{
     },
     layer::{ConsumeErrLayer, MapOutputLayer},
     net::{
-        address::{Domain, SocketAddress},
+        address::SocketAddress,
         proxy::IoForwardService,
     },
     proxy::socks5::{Socks5Acceptor, server::Socks5PeekRouter},
@@ -48,7 +48,10 @@ use rama::{
     telemetry::tracing,
     tls::{
         rustls::server::TlsAcceptorLayer,
-        server::{SelfSignedData, TlsServerConfig},
+        server::{
+            CertificateIdentity, CertificateSubject, GeneratedServerAuthConfig, LeafCertRequest,
+            SelfSignedCaConfig, TlsServerConfig,
+        },
     },
     utils::octets::kib,
 };
@@ -222,7 +225,7 @@ fn http_app(
 
     Arc::new(
         (
-            UpgradeLayer::new(
+            UpgradeLayer::new_with_services(
                 Executor::default(),
                 HttpMatcher::path("/ws").and_custom(WebSocketMatcher::new()),
                 WebSocketAcceptor::new().with_per_message_deflate(),
@@ -275,10 +278,17 @@ async fn spawn_https_server_inner(
     advertise_connect: bool,
 ) -> (u16, tokio::task::JoinHandle<()>) {
     let tls_data = TlsServerConfig::new()
-        .try_with_self_signed(SelfSignedData {
-            organisation_name: Some("Rama FFI HTTPS E2E".to_owned()),
-            common_name: Some(Domain::from_static("127.0.0.1")),
-            ..Default::default()
+        .try_with_generated_server_auth(GeneratedServerAuthConfig::GeneratedCa {
+            ca: SelfSignedCaConfig {
+                subject: CertificateSubject {
+                    organisation_name: Some("Rama FFI HTTPS E2E".to_owned()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            leaf: LeafCertRequest::new(CertificateIdentity::Ip(
+                std::net::Ipv4Addr::LOCALHOST.into(),
+            )),
         })
         .expect("self-signed")
         .with_alpn_http_auto();
@@ -339,10 +349,17 @@ pub(crate) async fn spawn_raw_tcp_echo() -> (u16, tokio::task::JoinHandle<()>) {
 
 pub(crate) async fn spawn_raw_tls_echo() -> (u16, tokio::task::JoinHandle<()>) {
     let tls_data = TlsServerConfig::new()
-        .try_with_self_signed(SelfSignedData {
-            organisation_name: Some("Rama FFI Raw TLS E2E".to_owned()),
-            common_name: Some(Domain::from_static("127.0.0.1")),
-            ..Default::default()
+        .try_with_generated_server_auth(GeneratedServerAuthConfig::GeneratedCa {
+            ca: SelfSignedCaConfig {
+                subject: CertificateSubject {
+                    organisation_name: Some("Rama FFI Raw TLS E2E".to_owned()),
+                    ..Default::default()
+                },
+                ..Default::default()
+            },
+            leaf: LeafCertRequest::new(CertificateIdentity::Ip(
+                std::net::Ipv4Addr::LOCALHOST.into(),
+            )),
         })
         .expect("self-signed");
 
@@ -402,12 +419,12 @@ pub(crate) async fn spawn_combined_proxy() -> (u16, tokio::task::JoinHandle<()>)
     http_server.h2_mut().set_enable_connect_protocol();
 
     let http_proxy = http_server.service(
-        UpgradeLayer::new(
+        UpgradeLayer::new_with_services(
             exec.clone(),
             HttpMatcher::header_exists(SEC_WEBSOCKET_VERSION)
                 .negate()
                 .and_method_connect(),
-            DefaultHttpProxyConnectReplyService::new(),
+            LazyHttpProxyConnectReplyService::new(),
             (ConsumeErrLayer::trace_as_debug(), MapOutputLayer::new(drop)).into_layer(
                 IoToProxyBridgeIoLayer::extension_connector_target()
                     .with_connector(rama::dns::client::DnsConnector::new(
@@ -440,17 +457,22 @@ async fn http_plain_proxy(req: Request) -> Result<Response, Infallible> {
         .without_proxy_support()
         .without_tls_support()
         .with_default_http_connector(Executor::default())
+        .without_connection_pool()
         .build_client();
 
     if is_http_req_websocket_handshake(&req) {
-        let ws_client = HttpUpgradeMitmRelayLayer::new(
-            Executor::default(),
-            HttpWebSocketRelayServiceRequestMatcher::new(
-                (ConsumeErrLayer::trace_as_debug(), MapOutputLayer::new(drop))
-                    .into_layer(IoForwardService::default()),
+        let ws_client = (
+            RemoveRequestHeaderLayer::hop_by_hop(),
+            HttpUpgradeMitmRelayLayer::new(
+                Executor::default(),
+                HttpWebSocketRelayServiceRequestMatcher::new(
+                    (ConsumeErrLayer::trace_as_debug(), MapOutputLayer::new(drop))
+                        .into_layer(IoForwardService::default()),
+                ),
             ),
+            RemoveResponseHeaderLayer::hop_by_hop(),
         )
-        .into_layer(inner_client);
+            .into_layer(inner_client);
 
         return Ok(match ws_client.serve(req).await {
             Ok(resp) => resp,

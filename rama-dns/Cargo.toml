@@ -33,13 +33,13 @@ default = []
 hickory = ["dep:hickory-resolver"]
 # Optional [dial9] runtime telemetry support.
 #
-# [dial9]: https://github.com/dial9-rs/dial9-tokio-telemetry
-dial9 = ["dep:dial9-tokio-telemetry", "dep:dial9-trace-format", "rama-net/dial9"]
+# [dial9]: https://github.com/dial9-rs/dial9
+dial9 = ["dep:dial9", "dep:dial9-trace-format", "rama-net/dial9"]
 
 [dependencies]
 ahash = { workspace = true }
 arc-swap = { workspace = true }
-dial9-tokio-telemetry = { workspace = true, optional = true }
+dial9 = { workspace = true, optional = true }
 dial9-trace-format = { workspace = true, optional = true }
 hickory-resolver = { workspace = true, optional = true }
 moka = { workspace = true, features = ["future", "sync"] }
@@ -52,17 +52,29 @@ rand = { workspace = true }
 tokio = { workspace = true, features = ["macros", "net", "rt", "sync", "time"] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
+base64 = { workspace = true }
 libc = { workspace = true }
+rama-unix = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 windows-sys = { workspace = true, features = ["Win32_Foundation", "Win32_NetworkManagement_Dns"] }
 
 [build-dependencies]
 bindgen = { workspace = true }
+cc = { workspace = true }
 
 [dev-dependencies]
 ahash = { workspace = true }
 tokio = { workspace = true, features = ["rt-multi-thread", "test-util"] }
+
+# the systemd-resolved varlink client also builds under test on other unixes
+[target.'cfg(all(target_family = "unix", not(target_os = "linux")))'.dev-dependencies]
+base64 = { workspace = true }
+rama-unix = { workspace = true }
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
 
 [lints]
 workspace = true

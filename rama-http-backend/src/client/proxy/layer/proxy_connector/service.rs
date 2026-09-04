@@ -1,10 +1,10 @@
 use rama_core::error::BoxErrorExt as _;
 
-use super::InnerHttpProxyConnector;
+use super::{HttpProxyVersionPolicy, InnerHttpProxyConnector};
 use pin_project_lite::pin_project;
 use rama_core::{
     Service,
-    error::{BoxError, ErrorContext as _},
+    error::BoxError,
     extensions::{Extension, Extensions, ExtensionsRef},
     io::Io,
     telemetry::tracing,
@@ -17,9 +17,13 @@ use rama_http::{
 use rama_http_headers::ProxyAuthorization;
 use rama_http_types::Version;
 use rama_net::{
-    AuthorityInputExt, Protocol, ProtocolInputExt,
-    address::ProxyAddress,
-    client::{ConnectorService, ConnectorTarget, EstablishedClientConnection},
+    AuthorityInputExt, HttpVersionInputExt, Protocol, ProtocolInputExt, TargetHttpVersionInputExt,
+    client::{
+        ConnectionError, ConnectionErrorKind, ConnectorService, ConnectorTarget,
+        ConnectorTransportProtocol, EstablishedClientConnection, ProxyRoute,
+    },
+    http::TargetHttpVersion,
+    transport::TransportProtocol,
     user::ProxyCredential,
 };
 use rama_utils::macros::define_inner_service_accessors;
@@ -31,39 +35,65 @@ use std::{ops, sync::Arc};
 use tokio::io::{AsyncRead, AsyncWrite};
 
 #[cfg(feature = "tls")]
-use rama_tls::TlsTunnel;
+use rama_net::tls::TlsAlpn;
+#[cfg(feature = "tls")]
+use rama_tls::{TlsTunnel, client::NegotiatedTlsParameters};
 
 /// A connector which can be used to establish a connection over an HTTP Proxy.
 ///
 /// This behaviour is optional and only triggered in case there
-/// is a [`ProxyAddress`] found in the [`Extensions`].
+/// is a proxied [`ProxyRoute`] found in the [`Extensions`].
 #[derive(Debug, Clone)]
 pub struct HttpProxyConnector<S> {
     pub(super) inner: S,
     pub(super) required: bool,
-    pub(super) version: Option<Version>,
+    pub(super) tls_proxy_supported: bool,
+    pub(super) version_policy: HttpProxyVersionPolicy,
     pub(super) headers: Option<HeaderMap>,
 }
 
 impl<S> HttpProxyConnector<S> {
     /// Creates a new [`HttpProxyConnector`].
     ///
-    /// Protocol version is set to HTTP/1.1 by default.
+    /// CONNECT and HTTPS-proxy protocol versions default to HTTP/1.1.
+    /// Plaintext forward-proxy requests follow the target HTTP version.
     pub(super) fn new(inner: S, required: bool) -> Self {
         Self {
             inner,
             required,
-            version: Some(Version::HTTP_11),
+            tls_proxy_supported: true,
+            version_policy: HttpProxyVersionPolicy::Automatic {
+                connect_fallback: Some(Version::HTTP_11),
+            },
             headers: None,
         }
     }
 
     generate_set_and_with! {
-        /// Set the HTTP version to use for the CONNECT request.
+        /// Set whether the inner connector supports TLS to an HTTPS proxy.
         ///
-        /// By default this is set to HTTP/1.1.
+        /// When disabled, selecting an HTTPS proxy produces a route-specific
+        /// protocol error instead of sending plaintext to it.
+        pub fn tls_proxy_support(mut self, supported: bool) -> Self {
+            self.tls_proxy_supported = supported;
+            self
+        }
+    }
+
+    generate_set_and_with! {
+        /// Set the HTTP version used to communicate with the proxy.
+        ///
+        /// This pins plaintext forward-proxy requests and CONNECT requests to
+        /// the given version, and constrains HTTPS-proxy ALPN accordingly.
+        /// Without an explicit version, plaintext forward-proxy requests follow
+        /// the target version. Connectors created with [`Self::optional`] or
+        /// [`Self::required`] default CONNECT and HTTPS-proxy traffic to
+        /// HTTP/1.1; [`HttpProxyConnectorLayer::default`] instead follows
+        /// negotiated HTTPS-proxy ALPN and otherwise falls back to HTTP/1.1.
+        ///
+        /// [`HttpProxyConnectorLayer::default`]: super::HttpProxyConnectorLayer
         pub fn version(mut self, version: Version) -> Self {
-            self.version = Some(version);
+            self.version_policy = HttpProxyVersionPolicy::Fixed(version);
             self
         }
     }
@@ -81,7 +111,7 @@ impl<S> HttpProxyConnector<S> {
     }
 
     /// Create a new [`HttpProxyConnector`]
-    /// which will only connect via an http proxy in case the [`ProxyAddress`] is available
+    /// which will only connect via an HTTP proxy when a proxied [`ProxyRoute`] is available
     /// in the [`Extensions`].
     #[must_use]
     pub fn optional(inner: S) -> Self {
@@ -89,7 +119,7 @@ impl<S> HttpProxyConnector<S> {
     }
 
     /// Create a new [`HttpProxyConnector`]
-    /// which will always connect via an http proxy, but fail in case the [`ProxyAddress`] is
+    /// which will always connect via an HTTP proxy, but fail when a proxied [`ProxyRoute`] is
     /// not available in the [`Extensions`].
     #[must_use]
     pub fn required(inner: S) -> Self {
@@ -102,28 +132,42 @@ impl<S> HttpProxyConnector<S> {
 impl<S, Input> Service<Input> for HttpProxyConnector<S>
 where
     S: ConnectorService<Input, Connection: Io + Unpin>,
-    Input: AuthorityInputExt + ProtocolInputExt + Send + ExtensionsRef + 'static,
+    Input: AuthorityInputExt
+        + ProtocolInputExt
+        + HttpVersionInputExt
+        + TargetHttpVersionInputExt
+        + Send
+        + ExtensionsRef
+        + 'static,
 {
     type Output = EstablishedClientConnection<MaybeHttpProxiedConnection<S::Connection>, Input>;
-    type Error = BoxError;
+    type Error = ConnectionError;
 
     async fn serve(&self, input: Input) -> Result<Self::Output, Self::Error> {
-        let maybe_proxy_info = input.extensions().get_ref::<ProxyAddress>().cloned();
+        let maybe_proxy_info = input
+            .extensions()
+            .get_ref::<ProxyRoute>()
+            .and_then(ProxyRoute::proxy_address)
+            .cloned();
 
         let Some(proxy_info) = maybe_proxy_info else {
             // return early in case we did not use a proxy
 
             return if self.required {
-                Err("http proxy required but none is defined".into())
+                Err(ConnectionError::local(
+                    BoxError::from_static_str("http proxy required but none is defined"),
+                    ConnectionErrorKind::InvalidInput,
+                ))
             } else {
                 tracing::trace!(
                     "http proxy connector: no proxy required or set: proceed with direct connection"
                 );
                 let EstablishedClientConnection { input, conn } =
-                    self.inner
-                        .connect(input)
-                        .await
-                        .context("establish direct connection (no http proxy given or required)")?;
+                    self.inner.connect(input).await.map_err(|error| {
+                        error.context(
+                            "establish direct connection (no http proxy given or required)",
+                        )
+                    })?;
                 return Ok(EstablishedClientConnection {
                     input,
                     conn: MaybeHttpProxiedConnection::direct(conn),
@@ -137,20 +181,68 @@ where
             .map(|p| p.is_http())
             .unwrap_or(true)
         {
-            return Err(BoxError::from_static_str(
-                "http proxy connector can only serve http protocol",
+            return Err(ConnectionError::transport(
+                BoxError::from_static_str("http proxy connector can only serve http protocol"),
+                ConnectionErrorKind::Protocol,
+            )
+            .context_debug_field("protocol", proxy_info.protocol.clone()));
+        }
+
+        if !self.tls_proxy_supported
+            && proxy_info
+                .protocol
+                .as_ref()
+                .is_some_and(Protocol::is_secure)
+        {
+            return Err(ConnectionError::transport(
+                BoxError::from_static_str("https proxy selected without proxy-side TLS support"),
+                ConnectionErrorKind::Protocol,
             ));
         }
 
-        let authority = input
-            .authority()
-            .context("http proxy connector: resolve authority")?;
+        let authority = input.authority().ok_or_else(|| {
+            ConnectionError::local(
+                BoxError::from_static_str("http proxy connector: authority missing from input"),
+                ConnectionErrorKind::InvalidInput,
+            )
+        })?;
         let app_protocol = input.protocol().cloned();
+        let app_is_http = app_protocol.as_ref().is_some_and(Protocol::is_http_based);
+        let use_forward_proxy = app_protocol
+            .as_ref()
+            .is_some_and(|protocol| protocol.is_http_based() && !protocol.is_secure());
+        let proxy_is_secure = proxy_info
+            .protocol
+            .as_ref()
+            .is_some_and(Protocol::is_secure);
+        let requested_http_version = crate::client::conn::resolve_input_target_http_version(&input);
+
+        if app_is_http && !use_forward_proxy && requested_http_version == Some(Version::HTTP_3) {
+            return Err(ConnectionError::local(
+                BoxError::from_static_str(
+                    "http proxy connector: HTTP/3 tunneling requires CONNECT-UDP",
+                ),
+                ConnectionErrorKind::InvalidInput,
+            ));
+        }
+
+        let plaintext_forward_version = if use_forward_proxy && !proxy_is_secure {
+            resolve_forward_proxy_version(self.version_policy, requested_http_version, None, false)?
+        } else {
+            None
+        };
+
+        if let Some(version) = self.version_policy.connect_version() {
+            validate_connect_version(version)?;
+        }
 
         // insert target so that inner connector can use it instead of input's version
         input
             .extensions()
             .insert(ConnectorTarget(proxy_info.address.clone()));
+        input
+            .extensions()
+            .insert(ConnectorTransportProtocol(TransportProtocol::Tcp));
 
         #[cfg(feature = "tls")]
         // in case the provider gave us a proxy info, we insert it into the context
@@ -166,17 +258,22 @@ where
                 "http proxy connector: preparing proxy connection for tls tunnel",
             );
             input.extensions().insert(TlsTunnel {
-                sni: Some(proxy_info.address.host.clone()),
+                server_identity: Some(proxy_info.address.host.clone()),
+                application_protocol: Some(Protocol::HTTPS),
+                alpn: self
+                    .version_policy
+                    .connect_version()
+                    .and_then(connect_version_alpn),
             });
         }
 
-        let EstablishedClientConnection { input, conn } = self
-            .inner
-            .connect(input)
-            .await
-            .context("establish connection to proxy")
-            .context_field("address", proxy_info.address.clone())
-            .context_debug_field("protocol", proxy_info.protocol.clone())?;
+        let EstablishedClientConnection { input, conn } =
+            self.inner.connect(input).await.map_err(|error| {
+                error
+                    .context("establish connection to proxy")
+                    .context_field("address", proxy_info.address.clone())
+                    .context_debug_field("protocol", proxy_info.protocol.clone())
+            })?;
 
         tracing::trace!(
             server.address = %authority.host,
@@ -184,15 +281,28 @@ where
             "http proxy connector: connected to proxy",
         );
 
-        if !app_protocol
-            .as_ref()
-            .map(|p| p.is_secure())
-            // TODO: re-evaluate this fallback at some point... seems pretty flawed to me
-            .unwrap_or_else(|| authority.port.as_u16() == Some(Protocol::HTTPS_DEFAULT_PORT))
-        {
-            // unless the scheme is not secure, in such a case no handshake is required...
-            // we do however need to add authorization headers if credentials are present
-            // => for this the user has to use another middleware as we do not have access to that here
+        let negotiated_version = if proxy_is_secure {
+            negotiated_proxy_http_version(conn.extensions())?
+        } else {
+            None
+        };
+        if use_forward_proxy {
+            // Protocols supporting plaintext forward-proxy form can reuse the
+            // proxy stream. Other byte-stream protocols require a tunnel.
+            let proxy_http_version = if proxy_is_secure {
+                resolve_forward_proxy_version(
+                    self.version_policy,
+                    requested_http_version,
+                    negotiated_version,
+                    true,
+                )?
+            } else {
+                plaintext_forward_version
+            };
+            if let Some(proxy_http_version) = proxy_http_version {
+                conn.extensions()
+                    .insert(TargetHttpVersion(proxy_http_version));
+            }
             return Ok(EstablishedClientConnection {
                 input,
                 conn: MaybeHttpProxiedConnection::proxied(conn),
@@ -200,11 +310,19 @@ where
         }
 
         let mut connector =
-            InnerHttpProxyConnector::new(authority.clone(), input.extensions().clone())?;
+            InnerHttpProxyConnector::new(authority.clone(), input.extensions().clone()).map_err(
+                |error| {
+                    ConnectionError::local(error, ConnectionErrorKind::InvalidInput)
+                        .context("http proxy connector: build CONNECT request")
+                },
+            )?;
 
-        if let Some(version) = self.version {
-            connector.set_version(version);
-        }
+        let proxy_http_version = resolve_connect_version(
+            self.version_policy.connect_version(),
+            negotiated_version,
+            proxy_is_secure,
+        )?;
+        connector.set_version(proxy_http_version);
 
         if let Some(credential) = proxy_info.credential.clone() {
             match credential {
@@ -228,7 +346,8 @@ where
         let (headers, conn) = connector
             .handshake(conn)
             .await
-            .context("http proxy handshake")?;
+            .map_err(ConnectionError::from)
+            .map_err(|error| error.context("http proxy handshake"))?;
 
         let conn = MaybeHttpProxiedConnection::upgraded_proxy(conn);
 
@@ -242,6 +361,125 @@ where
             "http proxy connector: connected to proxy: ready secure request",
         );
         Ok(EstablishedClientConnection { input, conn })
+    }
+}
+
+fn validate_connect_version(version: Version) -> Result<(), ConnectionError> {
+    if matches!(
+        version,
+        Version::HTTP_10 | Version::HTTP_11 | Version::HTTP_2
+    ) {
+        Ok(())
+    } else {
+        Err(ConnectionError::local(
+            BoxError::from_static_str("http proxy connector: unsupported HTTP version"),
+            ConnectionErrorKind::InvalidInput,
+        )
+        .context_debug_field("version", version))
+    }
+}
+
+fn resolve_connect_version(
+    configured: Option<Version>,
+    negotiated: Option<Version>,
+    proxy_is_secure: bool,
+) -> Result<Version, ConnectionError> {
+    if let Some(configured) = configured {
+        validate_connect_version(configured)?;
+        if proxy_is_secure {
+            match negotiated {
+                Some(negotiated) if negotiated != configured => {
+                    return Err(ConnectionError::transport(
+                        BoxError::from_static_str(
+                            "HTTPS proxy negotiated an incompatible HTTP version",
+                        ),
+                        ConnectionErrorKind::Protocol,
+                    )
+                    .context_debug_field("configured_version", configured)
+                    .context_debug_field("negotiated_version", negotiated));
+                }
+                None if configured == Version::HTTP_2 => {
+                    return Err(ConnectionError::transport(
+                        BoxError::from_static_str(
+                            "HTTPS proxy did not negotiate the required HTTP/2 ALPN",
+                        ),
+                        ConnectionErrorKind::Protocol,
+                    ));
+                }
+                _ => {}
+            }
+        }
+        return Ok(configured);
+    }
+
+    let Some(version) = negotiated else {
+        return Ok(Version::HTTP_11);
+    };
+    if matches!(
+        version,
+        Version::HTTP_10 | Version::HTTP_11 | Version::HTTP_2
+    ) {
+        Ok(version)
+    } else {
+        Err(ConnectionError::transport(
+            BoxError::from_static_str("HTTPS proxy negotiated an unsupported HTTP version"),
+            ConnectionErrorKind::Protocol,
+        )
+        .context_debug_field("negotiated_version", version))
+    }
+}
+
+fn resolve_forward_proxy_version(
+    policy: HttpProxyVersionPolicy,
+    requested: Option<Version>,
+    negotiated: Option<Version>,
+    proxy_is_secure: bool,
+) -> Result<Option<Version>, ConnectionError> {
+    // A request's explicit target version is also the wire version for a
+    // plaintext forward proxy. It must never configure an HTTPS proxy, whose
+    // ALPN (or explicit connector policy) describes the physical connection.
+    if proxy_is_secure {
+        return resolve_connect_version(policy.connect_version(), negotiated, true).map(Some);
+    }
+
+    policy
+        .forward_version(requested)
+        .map(|version| {
+            validate_connect_version(version)?;
+            Ok(version)
+        })
+        .transpose()
+}
+
+#[cfg(feature = "tls")]
+fn negotiated_proxy_http_version(
+    extensions: &Extensions,
+) -> Result<Option<Version>, ConnectionError> {
+    let Some(protocol) = extensions
+        .get_ref::<NegotiatedTlsParameters>()
+        .and_then(|parameters| parameters.application_layer_protocol.clone())
+    else {
+        return Ok(None);
+    };
+
+    Version::try_from(protocol).map(Some).map_err(|error| {
+        ConnectionError::transport(error, ConnectionErrorKind::Protocol)
+            .context("HTTPS proxy negotiated an invalid HTTP ALPN")
+    })
+}
+
+#[cfg(not(feature = "tls"))]
+fn negotiated_proxy_http_version(_: &Extensions) -> Result<Option<Version>, ConnectionError> {
+    Ok(None)
+}
+
+#[cfg(feature = "tls")]
+fn connect_version_alpn(version: Version) -> Option<TlsAlpn> {
+    match version {
+        Version::HTTP_10 => Some(TlsAlpn::empty()),
+        Version::HTTP_11 => Some(TlsAlpn::http_1()),
+        Version::HTTP_2 => Some(TlsAlpn::http_2()),
+        _ => None,
     }
 }
 
@@ -275,7 +513,7 @@ impl ops::Deref for HttpProxyConnectResponseHeaders {
 }
 
 pin_project! {
-    /// A connection which will be proxied if a [`ProxyAddress`] was configured
+    /// A connection which will be proxied if a proxied [`ProxyRoute`] was configured.
     pub struct MaybeHttpProxiedConnection<S> {
         #[pin]
         inner: Connection<S>,
@@ -420,18 +658,582 @@ impl<Conn: AsyncRead> AsyncRead for MaybeHttpProxiedConnection<Conn> {
 mod tests {
     use super::*;
     use crate::{client::proxy::layer::HttpProxyConnectorLayer, server::HttpServer};
-    use rama_core::{Layer, layer::MapOutputLayer, rt::Executor, service::service_fn};
-    use rama_http_types::{Body, Request, Response};
+    use rama_core::{
+        Layer,
+        futures::{Stream, stream},
+        layer::MapOutputLayer,
+        rt::Executor,
+        service::service_fn,
+    };
+    use rama_http_types::{Body, Request, Response, conn::FallbackHttpVersion};
     use rama_net::{
         Protocol,
-        address::{HostWithPort, ProxyAddress},
+        address::{Domain, HostWithPort, ProxyAddress},
+        client::{
+            AddressCandidates, ConnectRequest, ConnectionErrorDomain, ConnectionErrorKind,
+            ConnectorService, ConnectorTargetStream, ProxyRoute, ProxyRoutes, ProxyRoutesConnector,
+        },
+        http::HttpRequestVersion,
         test_utils::client::{MockConnectorService, MockSocket},
     };
-    use std::convert::Infallible;
+    use rama_tcp::client::service::TcpConnector;
+    use std::{
+        convert::Infallible,
+        net::{IpAddr, SocketAddr},
+        sync::atomic::{AtomicUsize, Ordering},
+    };
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 
     #[derive(Debug, Clone, Extension)]
     #[extension(tags(http))]
     struct ConnMarker(u32);
+
+    struct OneCandidate {
+        domain: Domain,
+        ip_addr: IpAddr,
+    }
+
+    impl AddressCandidates for OneCandidate {
+        fn domain(&self) -> &Domain {
+            &self.domain
+        }
+
+        fn stream<'a>(
+            &'a self,
+            _: &'a Extensions,
+        ) -> core::pin::Pin<Box<dyn Stream<Item = Result<IpAddr, BoxError>> + Send + 'a>> {
+            Box::pin(stream::iter([Ok(self.ip_addr)]))
+        }
+    }
+
+    #[tokio::test]
+    async fn proxy_route_ignores_stale_origin_candidates() {
+        let proxy_addr = SocketAddr::from(([127, 0, 0, 1], 8080));
+        let origin_ip = IpAddr::from([127, 0, 0, 1]);
+        let recorded = Arc::new(rama_utils::collections::AppendOnlyVec::<SocketAddr>::new());
+        let transport = TcpConnector::new().with_connector({
+            let recorded = Arc::clone(&recorded);
+            move |addr| {
+                recorded.push(addr);
+                async { Err::<rama_tcp::TcpStream, _>(std::io::Error::other("denied")) }
+            }
+        });
+        let connector = HttpProxyConnector::required(transport);
+        let input = ConnectRequest::new(HostWithPort::example_domain_http())
+            .with_application_protocol(Protocol::HTTP);
+        input
+            .extensions
+            .insert(ConnectorTargetStream::new(OneCandidate {
+                domain: Domain::example(),
+                ip_addr: origin_ip,
+            }));
+        input.extensions.insert(ProxyRoute::Proxy(ProxyAddress {
+            address: proxy_addr.into(),
+            credential: None,
+            protocol: Some(Protocol::HTTP),
+        }));
+
+        let error = connector.serve(input).await.unwrap_err();
+        assert_eq!(error.domain(), ConnectionErrorDomain::Transport);
+        assert_eq!(error.kind(), ConnectionErrorKind::Unavailable);
+        assert_eq!(recorded.iter().copied().collect::<Vec<_>>(), [proxy_addr]);
+    }
+
+    #[tokio::test]
+    async fn rejects_unsupported_proxy_http_version_as_local_input() {
+        let http_server =
+            HttpServer::auto(Executor::default()).service(service_fn(async |_req: Request| {
+                Ok::<_, Infallible>(Response::new(Body::empty()))
+            }));
+        let proxy_connector = HttpProxyConnectorLayer::required()
+            .with_version(Version::HTTP_3)
+            .into_layer(MockConnectorService::new(move || http_server.clone()));
+
+        let req = Request::builder()
+            .uri("https://example.com")
+            .body(Body::empty())
+            .unwrap();
+        req.extensions().insert(ProxyRoute::Proxy(ProxyAddress {
+            address: HostWithPort::example_domain_http(),
+            credential: None,
+            protocol: Some(Protocol::HTTP),
+        }));
+
+        let error = proxy_connector
+            .serve(req)
+            .await
+            .expect_err("HTTP/3 proxy configuration should be rejected");
+        assert_eq!(error.domain(), ConnectionErrorDomain::Local);
+        assert_eq!(error.kind(), ConnectionErrorKind::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn unsupported_proxy_routes_do_not_fall_back_to_direct() {
+        for protocol in [Protocol::SOCKS5, Protocol::HTTPS] {
+            let inner = MockConnectorService::new(|| {
+                service_fn(async |_socket: MockSocket| Ok::<_, Infallible>(()))
+            });
+            let inner = HttpProxyConnector::optional(inner).with_tls_proxy_support(false);
+            let connector = ProxyRoutesConnector::new(inner);
+            let input = ConnectRequest::new(HostWithPort::example_domain_http());
+            input.extensions.insert(ProxyRoutes::new([
+                ProxyRoute::Proxy(ProxyAddress {
+                    address: HostWithPort::example_domain_http(),
+                    credential: None,
+                    protocol: Some(protocol.clone()),
+                }),
+                ProxyRoute::Direct,
+            ]));
+
+            let error = Box::pin(connector.connect(input)).await.unwrap_err();
+            assert_eq!(error.domain(), ConnectionErrorDomain::Transport);
+            assert_eq!(error.kind(), ConnectionErrorKind::Protocol);
+        }
+    }
+
+    #[tokio::test]
+    async fn plaintext_non_http_protocol_uses_connect() {
+        for protocol in [Protocol::ICAP, Protocol::from_static("custom")] {
+            let http_server = HttpServer::auto(Executor::default()).service(service_fn(
+                async move |req: Request| {
+                    assert_eq!(req.method(), rama_http_types::Method::CONNECT);
+                    Ok::<_, Infallible>(Response::new(Body::empty()))
+                },
+            ));
+            let proxy_connector = HttpProxyConnectorLayer::required()
+                .into_layer(MockConnectorService::new(move || http_server.clone()));
+            let request = ConnectRequest::new(HostWithPort::example_domain_http())
+                .with_application_protocol(protocol.clone());
+            request.extensions.insert(ProxyRoute::Proxy(ProxyAddress {
+                address: HostWithPort::example_domain_http(),
+                credential: None,
+                protocol: Some(Protocol::HTTP),
+            }));
+
+            let established = proxy_connector
+                .serve(request)
+                .await
+                .expect("plaintext non-HTTP application uses CONNECT");
+            assert!(matches!(
+                established.conn.inner,
+                Connection::UpgradedProxy { .. }
+            ));
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn https_proxy_tunnel_declares_http_as_its_tls_protocol() {
+        let http_server =
+            HttpServer::auto(Executor::default()).service(service_fn(async |req: Request| {
+                assert_eq!(req.method(), rama_http_types::Method::CONNECT);
+                Ok::<_, Infallible>(Response::new(Body::empty()))
+            }));
+        let transport = MockConnectorService::new(move || http_server.clone());
+        let transport = service_fn(move |input: ConnectRequest| {
+            let transport = transport.clone();
+            async move {
+                let tunnel = input.extensions.get_ref::<TlsTunnel>().unwrap();
+                assert_eq!(tunnel.application_protocol.as_ref(), Some(&Protocol::HTTPS),);
+                assert_eq!(tunnel.alpn.as_ref(), Some(&TlsAlpn::http_1()));
+                transport.serve(input).await
+            }
+        });
+        let connector = HttpProxyConnectorLayer::required().into_layer(transport);
+        let input = ConnectRequest::new(HostWithPort::example_domain_https())
+            .with_application_protocol(Protocol::ICAPS);
+        input.extensions.insert(ProxyRoute::Proxy(ProxyAddress {
+            address: HostWithPort::example_domain_https(),
+            credential: None,
+            protocol: Some(Protocol::HTTPS),
+        }));
+
+        connector.serve(input).await.unwrap();
+    }
+
+    #[cfg(feature = "tls")]
+    #[test]
+    fn explicit_connect_versions_define_matching_proxy_alpn() {
+        for (version, expected) in [
+            (Version::HTTP_10, TlsAlpn::empty()),
+            (Version::HTTP_11, TlsAlpn::http_1()),
+            (Version::HTTP_2, TlsAlpn::http_2()),
+        ] {
+            assert_eq!(connect_version_alpn(version), Some(expected));
+        }
+        assert_eq!(connect_version_alpn(Version::HTTP_3), None);
+
+        assert_eq!(
+            resolve_connect_version(Some(Version::HTTP_11), None, true).unwrap(),
+            Version::HTTP_11
+        );
+        assert_eq!(
+            resolve_connect_version(Some(Version::HTTP_10), None, true).unwrap(),
+            Version::HTTP_10
+        );
+        let error = resolve_connect_version(Some(Version::HTTP_2), None, true).unwrap_err();
+        assert_eq!(error.domain(), ConnectionErrorDomain::Transport);
+        assert_eq!(error.kind(), ConnectionErrorKind::Protocol);
+        let error = resolve_connect_version(Some(Version::HTTP_11), Some(Version::HTTP_2), true)
+            .unwrap_err();
+        assert_eq!(error.domain(), ConnectionErrorDomain::Transport);
+        assert_eq!(error.kind(), ConnectionErrorKind::Protocol);
+        assert_eq!(
+            resolve_connect_version(None, Some(Version::HTTP_2), true).unwrap(),
+            Version::HTTP_2
+        );
+        assert_eq!(
+            resolve_connect_version(None, None, true).unwrap(),
+            Version::HTTP_11
+        );
+        let error =
+            resolve_connect_version(None, Some(Version::HTTP_3), true).expect_err("unsupported");
+        assert_eq!(error.domain(), ConnectionErrorDomain::Transport);
+        assert_eq!(error.kind(), ConnectionErrorKind::Protocol);
+    }
+
+    #[test]
+    fn forward_proxy_version_uses_only_physical_connection_signals() {
+        assert_eq!(
+            resolve_forward_proxy_version(
+                HttpProxyVersionPolicy::Automatic {
+                    connect_fallback: Some(Version::HTTP_11),
+                },
+                Some(Version::HTTP_2),
+                None,
+                false,
+            )
+            .unwrap(),
+            Some(Version::HTTP_2)
+        );
+        assert_eq!(
+            resolve_forward_proxy_version(
+                HttpProxyVersionPolicy::Automatic {
+                    connect_fallback: Some(Version::HTTP_11),
+                },
+                None,
+                None,
+                false,
+            )
+            .unwrap(),
+            None,
+        );
+        assert_eq!(
+            resolve_forward_proxy_version(
+                HttpProxyVersionPolicy::Fixed(Version::HTTP_11),
+                Some(Version::HTTP_2),
+                None,
+                false,
+            )
+            .unwrap(),
+            Some(Version::HTTP_11)
+        );
+        assert_eq!(
+            resolve_forward_proxy_version(
+                HttpProxyVersionPolicy::Automatic {
+                    connect_fallback: None,
+                },
+                Some(Version::HTTP_2),
+                Some(Version::HTTP_11),
+                true,
+            )
+            .unwrap(),
+            Some(Version::HTTP_11)
+        );
+    }
+
+    #[tokio::test]
+    async fn automatic_plaintext_forward_proxy_preserves_requested_version() {
+        for (target, fallback, requested, expected) in [
+            (None, None, None, None),
+            (None, None, Some(Version::HTTP_2), Some(Version::HTTP_2)),
+            (
+                None,
+                Some(Version::HTTP_2),
+                Some(Version::HTTP_11),
+                Some(Version::HTTP_2),
+            ),
+            (
+                Some(Version::HTTP_2),
+                Some(Version::HTTP_11),
+                Some(Version::HTTP_10),
+                Some(Version::HTTP_2),
+            ),
+            (
+                Some(Version::HTTP_11),
+                None,
+                Some(Version::HTTP_3),
+                Some(Version::HTTP_11),
+            ),
+            (
+                None,
+                Some(Version::HTTP_11),
+                Some(Version::HTTP_3),
+                Some(Version::HTTP_11),
+            ),
+        ] {
+            let connector =
+                HttpProxyConnectorLayer::required().into_layer(MockConnectorService::new(|| {
+                    service_fn(async |_socket: MockSocket| Ok::<_, Infallible>(()))
+                }));
+            let input = ConnectRequest::new(HostWithPort::example_domain_http())
+                .with_application_protocol(Protocol::HTTP);
+            if let Some(target) = target {
+                input.extensions.insert(TargetHttpVersion(target));
+            }
+            if let Some(fallback) = fallback {
+                input.extensions.insert(FallbackHttpVersion(fallback));
+            }
+            if let Some(requested) = requested {
+                input
+                    .extensions
+                    .insert(rama_net::http::HttpRequestVersion(requested));
+            }
+            input.extensions.insert(ProxyRoute::Proxy(ProxyAddress {
+                address: HostWithPort::example_domain_http(),
+                credential: None,
+                protocol: Some(Protocol::HTTP),
+            }));
+
+            let established = connector.serve(input).await.unwrap();
+            assert!(matches!(established.conn.inner, Connection::Proxied { .. }));
+            assert_eq!(
+                rama_net::ConnectorTransportProtocolInputExt::connector_transport_protocol(
+                    &established.input,
+                ),
+                Some(TransportProtocol::Tcp),
+            );
+            assert_eq!(
+                established
+                    .conn
+                    .extensions()
+                    .get_ref::<TargetHttpVersion>()
+                    .map(|target| target.0),
+                expected,
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn explicit_plaintext_forward_proxy_version_overrides_request() {
+        let connector = HttpProxyConnectorLayer::required()
+            .with_version(Version::HTTP_11)
+            .into_layer(MockConnectorService::new(|| {
+                service_fn(async |_socket: MockSocket| Ok::<_, Infallible>(()))
+            }));
+        let input = ConnectRequest::new(HostWithPort::example_domain_http())
+            .with_application_protocol(Protocol::HTTP);
+        input
+            .extensions
+            .insert(rama_net::http::HttpRequestVersion(Version::HTTP_3));
+        input.extensions.insert(ProxyRoute::Proxy(ProxyAddress {
+            address: HostWithPort::example_domain_http(),
+            credential: None,
+            protocol: Some(Protocol::HTTP),
+        }));
+
+        let established = connector.serve(input).await.unwrap();
+        assert_eq!(
+            rama_net::ConnectorTransportProtocolInputExt::connector_transport_protocol(
+                &established.input,
+            ),
+            Some(TransportProtocol::Tcp),
+        );
+        assert_eq!(
+            established
+                .conn
+                .extensions()
+                .get_ref::<TargetHttpVersion>()
+                .map(|target| target.0),
+            Some(Version::HTTP_11),
+        );
+    }
+
+    #[tokio::test]
+    async fn effective_http3_proxy_target_is_rejected_before_dial() {
+        for (app_protocol, target, fallback, requested) in [
+            (Protocol::HTTP, Some(Version::HTTP_3), None, None),
+            (
+                Protocol::HTTP,
+                None,
+                Some(Version::HTTP_3),
+                Some(Version::HTTP_11),
+            ),
+            (Protocol::HTTP, None, None, Some(Version::HTTP_3)),
+            (Protocol::HTTPS, Some(Version::HTTP_3), None, None),
+        ] {
+            let dials = Arc::new(AtomicUsize::new(0));
+            let observed_dials = dials.clone();
+            let connector = HttpProxyConnectorLayer::required().into_layer(
+                MockConnectorService::new(move || {
+                    observed_dials.fetch_add(1, Ordering::Relaxed);
+                    service_fn(async |_socket: MockSocket| Ok::<_, Infallible>(()))
+                }),
+            );
+            let input = ConnectRequest::new(HostWithPort::example_domain_http())
+                .with_application_protocol(app_protocol);
+            if let Some(target) = target {
+                input.extensions.insert(TargetHttpVersion(target));
+            }
+            if let Some(fallback) = fallback {
+                input.extensions.insert(FallbackHttpVersion(fallback));
+            }
+            if let Some(requested) = requested {
+                input
+                    .extensions
+                    .insert(rama_net::http::HttpRequestVersion(requested));
+            }
+            input.extensions.insert(ProxyRoute::Proxy(ProxyAddress {
+                address: HostWithPort::example_domain_http(),
+                credential: None,
+                protocol: Some(Protocol::HTTP),
+            }));
+
+            let error = connector
+                .serve(input)
+                .await
+                .expect_err("effective HTTP/3 requires a datagram proxy protocol");
+            assert_eq!(error.domain(), ConnectionErrorDomain::Local);
+            assert_eq!(error.kind(), ConnectionErrorKind::InvalidInput);
+            assert_eq!(dials.load(Ordering::Relaxed), 0);
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn automatic_connect_version_follows_proxy_tls_negotiation() {
+        let http_server =
+            HttpServer::auto(Executor::default()).service(service_fn(async |req: Request| {
+                assert_eq!(req.method(), rama_http_types::Method::CONNECT);
+                assert_eq!(req.version(), Version::HTTP_2);
+                Ok::<_, Infallible>(Response::new(Body::empty()))
+            }));
+        let transport = MockConnectorService::new(move || http_server.clone());
+        let transport = service_fn(move |input: ConnectRequest| {
+            let transport = transport.clone();
+            async move {
+                let tunnel = input.extensions.get_ref::<TlsTunnel>().unwrap();
+                assert!(tunnel.alpn.is_none());
+                let established = transport.serve(input).await?;
+                established
+                    .conn
+                    .extensions()
+                    .insert(NegotiatedTlsParameters {
+                        protocol_version: rama_tls::ProtocolVersion::TLSv1_3,
+                        application_layer_protocol: Some(
+                            rama_net::tls::ApplicationProtocol::HTTP_2,
+                        ),
+                        peer_certificate_chain: None,
+                    });
+                Ok::<_, Infallible>(established)
+            }
+        });
+        let connector = HttpProxyConnectorLayer::default().into_layer(transport);
+        let input = ConnectRequest::new(HostWithPort::example_domain_https());
+        input
+            .extensions
+            .insert(HttpRequestVersion(Version::HTTP_11));
+        input.extensions.insert(ProxyRoute::Proxy(ProxyAddress {
+            address: HostWithPort::example_domain_https(),
+            credential: None,
+            protocol: Some(Protocol::HTTPS),
+        }));
+
+        connector.serve(input).await.unwrap();
+    }
+
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn forward_proxy_version_follows_proxy_tls_negotiation() {
+        for (negotiated, expected) in [
+            (None, Version::HTTP_11),
+            (
+                Some(rama_net::tls::ApplicationProtocol::HTTP_2),
+                Version::HTTP_2,
+            ),
+        ] {
+            let transport = MockConnectorService::new(|| {
+                service_fn(async |_socket: MockSocket| Ok::<_, Infallible>(()))
+            });
+            let transport = MapOutputLayer::new(
+                move |established: EstablishedClientConnection<MockSocket, ConnectRequest>| {
+                    established
+                        .conn
+                        .extensions()
+                        .insert(NegotiatedTlsParameters {
+                            protocol_version: rama_tls::ProtocolVersion::TLSv1_3,
+                            application_layer_protocol: negotiated.clone(),
+                            peer_certificate_chain: None,
+                        });
+                    established
+                },
+            )
+            .into_layer(transport);
+            let connector = HttpProxyConnectorLayer::default().into_layer(transport);
+            let input = ConnectRequest::new(HostWithPort::example_domain_http())
+                .with_application_protocol(Protocol::HTTP);
+            input
+                .extensions
+                .insert(HttpRequestVersion(if expected == Version::HTTP_11 {
+                    Version::HTTP_2
+                } else {
+                    Version::HTTP_11
+                }));
+            input.extensions.insert(ProxyRoute::Proxy(ProxyAddress {
+                address: HostWithPort::example_domain_https(),
+                credential: None,
+                protocol: Some(Protocol::HTTPS),
+            }));
+
+            let established = connector.serve(input).await.unwrap();
+            assert!(matches!(established.conn.inner, Connection::Proxied { .. }));
+            assert_eq!(
+                established
+                    .conn
+                    .extensions()
+                    .get_ref::<TargetHttpVersion>()
+                    .map(|target| target.0),
+                Some(expected),
+            );
+        }
+    }
+
+    #[cfg(feature = "tls")]
+    #[tokio::test]
+    async fn plaintext_proxy_ignores_unrelated_tls_negotiation_metadata() {
+        let http_server =
+            HttpServer::auto(Executor::default()).service(service_fn(async |req: Request| {
+                assert_eq!(req.method(), rama_http_types::Method::CONNECT);
+                assert_eq!(req.version(), Version::HTTP_11);
+                Ok::<_, Infallible>(Response::new(Body::empty()))
+            }));
+        let transport = MockConnectorService::new(move || http_server.clone());
+        let transport = MapOutputLayer::new(
+            |established: EstablishedClientConnection<MockSocket, ConnectRequest>| {
+                established
+                    .conn
+                    .extensions()
+                    .insert(NegotiatedTlsParameters {
+                        protocol_version: rama_tls::ProtocolVersion::TLSv1_3,
+                        application_layer_protocol: Some(
+                            rama_net::tls::ApplicationProtocol::HTTP_2,
+                        ),
+                        peer_certificate_chain: None,
+                    });
+                established
+            },
+        )
+        .into_layer(transport);
+        let connector = HttpProxyConnectorLayer::default().into_layer(transport);
+        let input = ConnectRequest::new(HostWithPort::example_domain_https());
+        input.extensions.insert(ProxyRoute::Proxy(ProxyAddress {
+            address: HostWithPort::example_domain_http(),
+            credential: None,
+            protocol: Some(Protocol::HTTP),
+        }));
+
+        connector.serve(input).await.unwrap();
+    }
 
     #[tokio::test]
     async fn connection_extensions_preserved_across_proxy_connect_upgrade() {
@@ -454,11 +1256,11 @@ mod tests {
             .body(Body::empty())
             .unwrap();
 
-        req.extensions().insert(ProxyAddress {
+        req.extensions().insert(ProxyRoute::Proxy(ProxyAddress {
             address: HostWithPort::example_domain_http(),
             credential: None,
             protocol: Some(Protocol::HTTP),
-        });
+        }));
 
         let EstablishedClientConnection { conn, .. } = proxy_connector
             .serve(req)
@@ -470,5 +1272,64 @@ mod tests {
             .get_ref::<ConnMarker>()
             .expect("ConnMarker set on the pre-CONNECT connection must survive the upgrade");
         assert_eq!(marker.0, 42);
+    }
+
+    #[tokio::test]
+    async fn real_tcp_failure_falls_back_to_live_http_connect_proxy() {
+        let dead_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let dead_addr = dead_listener.local_addr().unwrap();
+        drop(dead_listener);
+
+        let live_listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let live_addr = live_listener.local_addr().unwrap();
+        let proxy_task = tokio::spawn(async move {
+            let (mut stream, _) = live_listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            let mut buffer = [0; 1024];
+            while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                let read = stream.read(&mut buffer).await.unwrap();
+                assert_ne!(read, 0, "CONNECT request ended before its headers");
+                request.extend_from_slice(&buffer[..read]);
+            }
+            let request = String::from_utf8(request).unwrap();
+            assert!(request.starts_with("CONNECT example.com:443 HTTP/1.1\r\n"));
+            stream
+                .write_all(b"HTTP/1.1 200 Connection Established\r\n\r\n")
+                .await
+                .unwrap();
+
+            let mut byte = [0];
+            assert_eq!(stream.read(&mut byte).await.unwrap(), 0);
+        });
+
+        let inner = HttpProxyConnector::optional(TcpConnector::new());
+        let connector = ProxyRoutesConnector::new(inner);
+        let input = ConnectRequest::new(HostWithPort::example_domain_https())
+            .with_application_protocol(Protocol::HTTPS);
+        input.extensions.insert(ProxyRoutes::new([
+            ProxyRoute::Proxy(
+                format!("http://{dead_addr}")
+                    .parse::<ProxyAddress>()
+                    .unwrap(),
+            ),
+            ProxyRoute::Proxy(
+                format!("http://{live_addr}")
+                    .parse::<ProxyAddress>()
+                    .unwrap(),
+            ),
+        ]));
+
+        let established = Box::pin(connector.connect(input)).await.unwrap();
+        assert_eq!(
+            established
+                .input
+                .extensions
+                .get_ref::<ProxyRoute>()
+                .and_then(ProxyRoute::proxy_address)
+                .map(|proxy| proxy.address.clone()),
+            Some(live_addr.into()),
+        );
+        drop(established.conn);
+        proxy_task.await.unwrap();
     }
 }

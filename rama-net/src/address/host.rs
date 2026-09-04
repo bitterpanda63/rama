@@ -14,8 +14,10 @@ use super::domain::{DomainLabelIter, DomainLabels, Label};
 use super::{Domain, UninterpretedHost, UninterpretedHostRef, parse_utils};
 use crate::address::ip::{
     IPV4_BROADCAST, IPV4_LOCALHOST, IPV4_UNSPECIFIED, IPV6_LOCALHOST, IPV6_UNSPECIFIED,
+    IntoCanonicalIpAddr as _,
 };
 
+use rama_core::bytes::BytesMut;
 use rama_core::error::BoxErrorExt as _;
 use rama_core::error::{BoxError, ErrorContext};
 
@@ -143,6 +145,55 @@ impl Host {
         HostRef::from(self).to_str()
     }
 
+    /// Returns `true` when this host has an empty textual representation.
+    ///
+    /// This checks the stored representation directly and never formats an IP
+    /// address or allocates a temporary [`String`].
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.view().is_empty()
+    }
+
+    /// Return the RFC 3986 canonical presentation of this host.
+    ///
+    /// Domain names are ASCII-lowercased. Preserved URI host bytes are first
+    /// promoted to a typed IP address or domain when possible; otherwise they
+    /// are ASCII-lowercased and their percent-encoding is normalized. IP
+    /// addresses are already canonical typed values.
+    #[must_use]
+    pub fn canonicalize(self) -> Self {
+        match self {
+            Self::Name(domain) => Self::Name(domain.canonicalize()),
+            Self::Address(address) => Self::Address(address),
+            Self::Uninterpreted(host) => {
+                if let Ok(address) = IpAddr::try_from(host.view()) {
+                    return Self::Address(address);
+                }
+                if let Ok(domain) = Domain::try_from(host.view()) {
+                    return Self::Name(domain.canonicalize());
+                }
+
+                let bytes = host.as_bytes();
+                if !bytes
+                    .iter()
+                    .any(|byte| *byte == b'%' || byte.is_ascii_uppercase())
+                {
+                    return Self::Uninterpreted(host);
+                }
+
+                let mut bytes = BytesMut::from(bytes);
+                for byte in bytes.iter_mut() {
+                    *byte = byte.to_ascii_lowercase();
+                }
+                crate::normalize::normalize_pct(&mut bytes);
+                Self::Uninterpreted(UninterpretedHost::from_validated_bytes(
+                    bytes.freeze(),
+                    host.is_bracketed(),
+                ))
+            }
+        }
+    }
+
     /// Returns the Unicode (display) form of this host. For named hosts,
     /// any `xn--` A-labels are inverse-encoded via UTS #46. IP addresses
     /// are rendered to their standard textual form.
@@ -227,6 +278,12 @@ pub enum HostRef<'a> {
 }
 
 impl<'a> HostRef<'a> {
+    /// Return an owned RFC 3986 canonical presentation of this host.
+    #[must_use]
+    pub fn canonicalize(self) -> Host {
+        self.into_owned().canonicalize()
+    }
+
     /// Returns this host as a string. Domain names and non-bracketed
     /// reg-names return `Cow::Borrowed` (no allocation); IP addresses
     /// and bracketed IP-literals are formatted into a fresh `String`.
@@ -237,6 +294,20 @@ impl<'a> HostRef<'a> {
             Self::Address(ip) => ip.to_string().into(),
             Self::Uninterpreted(host) if host.is_bracketed() => host.to_string().into(),
             Self::Uninterpreted(host) => host.as_str().into(),
+        }
+    }
+
+    /// Returns `true` when this host has an empty textual representation.
+    ///
+    /// Typed domain names and IP addresses are never empty. An uninterpreted
+    /// host is empty only when it has no bytes and is not an IP-literal enclosed
+    /// by brackets. This method does not format or allocate.
+    #[must_use]
+    pub fn is_empty(self) -> bool {
+        match self {
+            Self::Name(domain) => domain.as_str().is_empty(),
+            Self::Address(_) => false,
+            Self::Uninterpreted(host) => !host.is_bracketed() && host.as_str().is_empty(),
         }
     }
 
@@ -265,15 +336,16 @@ impl<'a> HostRef<'a> {
     /// or the `localhost` name also return `true`. Bracketed IPvFuture
     /// literals have no typed counterpart and are never loopback.
     ///
-    /// This is **not** browser-style normalization: alternate IPv4
+    /// IPv4-mapped IPv6 addresses are canonicalized before this check, so
+    /// `::ffff:127.0.0.1` is recognized as loopback. This is **not**
+    /// browser-style normalization: alternate IPv4
     /// spellings that parse as a [`Name`](Self::Name) (`0177.0.0.1`,
     /// `2130706433`, …) report as non-loopback — see the [`Host`] type
-    /// docs (SSRF awareness). IPv4-mapped IPv6 (`::ffff:127.0.0.1`)
-    /// follows std and is likewise not loopback.
+    /// docs (SSRF awareness).
     #[must_use]
     pub fn is_loopback(self) -> bool {
         match self {
-            Self::Address(ip) => ip.is_loopback(),
+            Self::Address(ip) => ip.into_canonical_ip_addr().is_loopback(),
             Self::Name(domain) => domain.is_loopback(),
             // Bridge pct-encoded / alternate bytes through their decoded
             // form, decoded once: a loopback IP literal, else the
@@ -284,7 +356,7 @@ impl<'a> HostRef<'a> {
                 let decoded = host.as_unicode();
                 decoded
                     .parse::<IpAddr>()
-                    .map(|ip| ip.is_loopback())
+                    .map(|ip| ip.into_canonical_ip_addr().is_loopback())
                     .unwrap_or_else(|_| super::domain::is_loopback_name(&decoded))
             }
         }
@@ -891,6 +963,59 @@ impl_serde_str!(display Host);
 mod tests {
     use super::*;
 
+    #[test]
+    fn empty_check_never_formats_the_host() {
+        let empty = Host::Uninterpreted(UninterpretedHost::from_validated_bytes(
+            rama_core::bytes::Bytes::new(),
+            false,
+        ));
+        assert!(empty.is_empty());
+        assert!(empty.view().is_empty());
+
+        assert!(!Host::EXAMPLE_NAME.is_empty());
+        assert!(!Host::LOCALHOST_IPV6.is_empty());
+
+        let bracketed = Host::Uninterpreted(UninterpretedHost::from_validated_bytes(
+            rama_core::bytes::Bytes::new(),
+            true,
+        ));
+        assert!(!bracketed.is_empty());
+    }
+
+    #[test]
+    fn canonicalize_normalizes_each_host_shape() {
+        assert_eq!(
+            Host::Name(Domain::from_static("EXAMPLE.Com"))
+                .canonicalize()
+                .to_str(),
+            "example.com"
+        );
+        assert_eq!(
+            Host::Address(IpAddr::V6(Ipv6Addr::LOCALHOST))
+                .canonicalize()
+                .to_str(),
+            "::1"
+        );
+
+        let encoded = Host::Uninterpreted(UninterpretedHost::from_validated_bytes(
+            rama_core::bytes::Bytes::from_static(b"EXA%6Dple.Com"),
+            false,
+        ));
+        assert!(matches!(
+            encoded.canonicalize(),
+            Host::Name(domain) if domain.as_str() == "example.com"
+        ));
+
+        let opaque = Host::Uninterpreted(UninterpretedHost::from_validated_bytes(
+            rama_core::bytes::Bytes::from_static(b"TAG%21,VALUE"),
+            false,
+        ));
+        assert!(matches!(
+            opaque.canonicalize(),
+            Host::Uninterpreted(host) if host.as_str() == "tag%21,value"
+        ));
+    }
+
     #[derive(Debug, Clone, Copy)]
     enum Is {
         Domain(&'static str),
@@ -1045,9 +1170,10 @@ mod tests {
                 "{s} should not be loopback",
             );
         }
-        // IPv4-mapped IPv6 loopback follows std semantics: not loopback.
+        // Security-sensitive host classification treats mapped IPv4
+        // addresses like their canonical IPv4 counterpart.
         let mapped = Host::Address(IpAddr::V6("::ffff:127.0.0.1".parse().unwrap()));
-        assert!(!mapped.is_loopback());
+        assert!(mapped.is_loopback());
     }
 
     #[test]
@@ -1336,7 +1462,7 @@ mod tests {
         // Mismatched bytes inside brackets → no match.
         assert!(h != "[v2.fe80::a]");
         // Edge: empty / too-short str inputs.
-        assert!(h != "");
+        assert!(!PartialEq::eq(&h, ""));
         assert!(h != "[]");
     }
 

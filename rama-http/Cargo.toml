@@ -15,12 +15,14 @@ allowed = []
 
 [package.metadata.docs.rs]
 all-features = true
+rustc-args = ["--cfg", "tokio_unstable"]
 rustdoc-args = ["--cfg", "docsrs"]
 # native C deps can't cross-compile in the docs.rs builder; linux-only docs
 targets = ["x86_64-unknown-linux-gnu"]
 
 [features]
 default = []
+dial9 = ["rama-core/dial9"]
 opentelemetry = ["rama-core/opentelemetry", "rama-net/opentelemetry"]
 compression = [
     "dep:async-compression",
@@ -56,7 +58,7 @@ memchr = { workspace = true, optional = true }
 mime_guess = { workspace = true, optional = true }
 multer = { workspace = true, optional = true }
 parking_lot = { workspace = true }
-percent-encoding = { workspace = true }
+percent-encoding = { workspace = true, features = ["std"] }
 pin-project-lite = { workspace = true }
 quick-xml = { workspace = true, optional = true, features = ["async-tokio"] }
 rama-core = { workspace = true, features = ["std"] }
@@ -65,7 +67,7 @@ rama-http-hyperium = { workspace = true, optional = true }
 rama-http-macros = { workspace = true, optional = true }
 rama-http-types = { workspace = true }
 rama-json = { workspace = true }
-rama-net = { workspace = true, features = ["std", "http"] }
+rama-net = { workspace = true, features = ["std"] }
 rama-utils = { workspace = true, features = ["std"] }
 rand = { workspace = true }
 rawzip = { workspace = true, optional = true }
@@ -83,7 +85,6 @@ parking_lot = { workspace = true }
 quickcheck = { workspace = true }
 quickcheck_macros = { workspace = true }
 serde_json = { workspace = true }
-tempfile = { workspace = true }
 time = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 tokio-test = { workspace = true }

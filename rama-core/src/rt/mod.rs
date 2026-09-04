@@ -10,6 +10,16 @@
 
 mod executor;
 #[doc(inline)]
-pub use executor::Executor;
+pub use executor::{Executor, spawn};
+
+mod owned;
+#[doc(inline)]
+pub use owned::{OwnedRuntime, OwnedRuntimeHandle};
+
+pub mod blocking;
 
 pub mod future;
+
+#[cfg(test)]
+#[cfg(feature = "dial9")]
+mod dial9_test_util;

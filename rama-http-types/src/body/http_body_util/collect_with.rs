@@ -179,8 +179,8 @@ mod tests {
     use crate::Body;
     use crate::body::util::{BodyExt, CollectErrorKind};
     use bytes::Bytes;
-    use futures_util::{StreamExt, stream};
     use rama_core::error::BoxError;
+    use rama_core::futures::{StreamExt, stream};
     use std::time::Duration;
 
     fn body_from_chunks(chunks: &[&'static [u8]]) -> Body {
@@ -278,7 +278,7 @@ mod tests {
         // the timeout, so collecting stops after reading just the first chunk.
         let s = stream::once(async { Ok::<_, BoxError>(Bytes::from_static(b"hello")) }).chain(
             stream::once(async {
-                tokio::time::sleep(Duration::from_secs(3600)).await;
+                tokio::time::sleep(Duration::from_hours(1)).await;
                 Ok::<_, BoxError>(Bytes::from_static(b"world"))
             }),
         );

@@ -11,17 +11,22 @@
 //!   (host-backed via tokio) elsewhere. Each is exposed under
 //!   [`client`] when the corresponding target is active.
 //! - [`client::TokioDnsResolver`] — host-backed resolver that uses the
-//!   blocking system getaddrinfo via tokio's threadpool.
+//!   blocking system getaddrinfo via tokio's threadpool; it supports address
+//!   records only and returns typed errors for CNAME, TXT, SVCB, and HTTPS lookups.
 //! - `client::HickoryDnsResolver` — pure-Rust resolver from the
 //!   Hickory DNS project (<https://github.com/hickory-dns/hickory-dns>);
 //!   gated behind the `hickory` feature.
 //! - [`client::DenyAllDnsResolver`] — fails every lookup with
 //!   [`client::DnsDeniedError`]; useful when DNS must be disabled.
-//! - [`client::EmptyDnsResolver`] — returns no addresses for every lookup.
+//! - [`client::EmptyDnsResolver`] — returns no records for every lookup.
 //!
-//! Implement [`client::resolver::DnsResolver`] yourself to plug in any
-//! other resolver, and combine resolvers with the chain / tuple / variant
+//! [`client::resolver::DnsResolver`] is the aggregate of the address, CNAME,
+//! TXT, and SVCB/HTTPS resolver traits. Implement those traits yourself to plug in
+//! another resolver, and combine resolvers with the chain / tuple / variant
 //! adapters under [`client`].
+//! [`client::resolver::DnsTxtResolver`] yields one [`wire::Txt`] per DNS TXT
+//! resource record; each value preserves that record's character-string
+//! boundaries.
 //!
 //! ### Picking a resolver for high-QPS workloads
 //!
@@ -31,14 +36,18 @@
 //! are fully asynchronous and scale naturally — no tokio blocking-pool
 //! traffic.
 //!
-//! `LinuxDnsResolver` (via `res_nsearch` / `getaddrinfo`) and
-//! [`client::TokioDnsResolver`] (via `getaddrinfo`) are different: each
-//! lookup occupies a tokio blocking-pool thread for the duration of the
-//! libc call. Under sustained high-concurrency DNS load (typical for
-//! forward proxies) that pool can become a bottleneck. For such
-//! workloads prefer the pure-Rust `client::HickoryDnsResolver` (gated
-//! behind the `hickory` feature), which speaks DNS directly over async
-//! UDP/TCP and gives finer control over caching and upstream selection.
+//! On Linux hosts whose NSS configuration selects `nss-resolve`,
+//! `LinuxDnsResolver` first tries systemd-resolved's varlink socket, which is
+//! likewise fully asynchronous. This path can also be enabled or disabled
+//! explicitly through `LinuxDnsResolver::builder()`. Where the daemon is not
+//! selected or available it falls back to `res_nsearch` / `getaddrinfo`, and
+//! there — as with [`client::TokioDnsResolver`] (via `getaddrinfo`) — each
+//! lookup occupies a tokio blocking-pool thread for the duration of the libc
+//! call. Under sustained high-concurrency DNS load (typical for forward
+//! proxies) that pool can become a bottleneck. For such workloads prefer the
+//! pure-Rust `client::HickoryDnsResolver` (gated behind the `hickory` feature),
+//! which speaks DNS directly over async UDP/TCP and gives finer control over
+//! caching and upstream selection.
 //!
 //! ## Global DNS resolver
 //!
@@ -56,6 +65,13 @@
 //! [`client::GlobalDnsResolver`] is a thin handle that defers fetching the
 //! global resolver until it's actually used — handy when you want to pass
 //! a resolver around without forcing it to be constructed yet.
+//!
+//! ## DNS wire data
+//!
+//! The [`wire`] module provides provider-neutral DNS wire vocabulary. It
+//! decodes A, AAAA, CNAME, and TXT RDATA as well as the shared RDATA used by
+//! SVCB and HTTPS records. DNS names, TXT string boundaries, and unknown
+//! service parameters are preserved.
 //!
 //! ## Rama
 //!
@@ -80,3 +96,4 @@
 pub mod dial9;
 
 pub mod client;
+pub mod wire;

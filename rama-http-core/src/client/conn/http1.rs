@@ -12,6 +12,7 @@ use rama_core::extensions::ExtensionsRef;
 use rama_core::telemetry::tracing::{debug, trace};
 use rama_http::StreamingBody;
 use rama_http_types::{Request, Response};
+use rama_net::conn::ConnectionHealthWatcher;
 use rama_net::extensions::StreamTransformed;
 use tokio::io::{AsyncRead, AsyncWrite};
 
@@ -99,6 +100,10 @@ where
 
     /// Prevent shutdown of the underlying IO object at the end of service the request,
     /// instead run `into_parts`. This is a convenience wrapper over `poll_without_shutdown`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection encounters an error while being polled to completion.
     pub async fn without_shutdown(self) -> crate::Result<Parts<T>> {
         let mut this = Some(self);
         std::future::poll_fn(move |cx| -> Poll<crate::Result<Parts<T>>> {
@@ -140,6 +145,10 @@ pub struct Builder {
 ///
 /// This is a shortcut for `Builder::new().handshake(io)`.
 /// See [`client::conn`](crate::client::conn) for more.
+///
+/// # Errors
+///
+/// Returns an error if the HTTP/1 connection handshake fails.
 pub async fn handshake<T, B>(io: T) -> crate::Result<(SendRequest<B>, Connection<T, B>)>
 where
     T: AsyncRead + AsyncWrite + Unpin + ExtensionsRef,
@@ -159,6 +168,8 @@ impl<B> SendRequest<B> {
     }
 
     /// Waits until the dispatcher is ready.
+    ///
+    /// # Errors
     ///
     /// If the associated connection is closed, this returns an Error.
     pub async fn ready(&mut self) -> crate::Result<()> {
@@ -210,6 +221,11 @@ where
     /// hyper closes the underlying connection when a request future is
     /// dropped before completion. Any subsequent calls on the same
     /// [`SendRequest`] will return a `canceled` error.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the connection is not ready or if an error occurs while
+    /// processing the request.
     pub fn send_request(
         &mut self,
         req: Request<B>,
@@ -236,7 +252,7 @@ where
     ///
     /// Returns a future that if successful, yields the `Response`.
     ///
-    /// # Error
+    /// # Errors
     ///
     /// If there was an error before trying to serialize the request to the
     /// connection, the message will be returned as part of this error.
@@ -523,6 +539,10 @@ impl Builder {
     ///
     /// Note, if [`Connection`] is not `await`-ed, [`SendRequest`] will
     /// do nothing.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the HTTP/1connection handshake fails.
     pub fn handshake<T, B>(
         &self,
         io: T,
@@ -613,7 +633,15 @@ mod upgrades {
                             "inner h1 connection for upgradeable connection was Some above",
                         );
                         let Parts { io, read_buf } = inner.into_parts();
-                        pending.fulfill(Upgraded::new(io, read_buf));
+                        // The h1 connection is consumed by the upgrade and no longer
+                        // belongs to the HTTP connection pool. The upgraded stream
+                        // forks these extensions, so it starts with health state of
+                        // its own instead of inheriting this broken mark.
+                        io.extensions()
+                            .get_ref_or_insert(ConnectionHealthWatcher::default)
+                            .mark_broken();
+                        let upgraded = Upgraded::new(io, read_buf);
+                        pending.fulfill(upgraded);
                         Ok(())
                     }
                     Err(e) => Err(e),

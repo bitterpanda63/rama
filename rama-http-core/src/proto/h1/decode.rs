@@ -148,8 +148,8 @@ impl Decoder {
         body: &mut R,
     ) -> Poll<Result<Frame<Bytes>, io::Error>> {
         trace!("decode; state={:?}", self.kind);
-        match self.kind {
-            Length(ref mut remaining) => {
+        match &mut self.kind {
+            Length(remaining) => {
                 if *remaining == 0 {
                     Poll::Ready(Ok(Frame::data(Bytes::new())))
                 } else {
@@ -170,13 +170,13 @@ impl Decoder {
                 }
             }
             Chunked {
-                ref mut state,
-                ref mut chunk_len,
-                ref mut extensions_cnt,
-                ref mut trailers_buf,
-                ref mut trailers_cnt,
-                ref h1_max_headers,
-                ref h1_max_header_size,
+                state,
+                chunk_len,
+                extensions_cnt,
+                trailers_buf,
+                trailers_cnt,
+                h1_max_headers,
+                h1_max_header_size,
             } => {
                 let h1_max_headers = h1_max_headers.unwrap_or(DEFAULT_MAX_HEADERS);
                 let h1_max_header_size = h1_max_header_size.unwrap_or(TRAILER_LIMIT);
@@ -219,7 +219,7 @@ impl Decoder {
                     }
                 }
             }
-            Eof(ref mut is_eof) => {
+            Eof(is_eof) => {
                 if *is_eof {
                     Poll::Ready(Ok(Frame::data(Bytes::new())))
                 } else {
@@ -658,17 +658,20 @@ fn decode_trailers(buf: &mut BytesMut, count: usize) -> Result<HeaderMap, io::Er
                     ));
                 };
 
-                if !super::encode::is_valid_trailer_field(&name) {
+                if !name.is_allowed_in_trailers() {
                     debug!("dropping disallowed trailer field: {name:?}");
                     continue;
                 }
 
-                let Ok(value) = HeaderValue::from_bytes(header.value) else {
+                let Ok(mut value) = HeaderValue::from_bytes(header.value) else {
                     return Err(io::Error::new(
                         io::ErrorKind::InvalidInput,
                         format!("Invalid header value: {header:?}"),
                     ));
                 };
+                if name.is_sensitive() {
+                    value.set_sensitive(true);
+                }
 
                 trailers.append(name, value);
             }
@@ -1083,14 +1086,14 @@ mod tests {
     fn test_decode_trailers() {
         let mut buf = BytesMut::new();
         buf.extend_from_slice(
-            b"Expires: Wed, 21 Oct 2015 07:28:00 GMT\r\nX-Stream-Error: failed to decode\r\n\r\n",
+            b"Expires: Wed, 21 Oct 2015 07:28:00 GMT\r\n\
+              ETag: \"generated-after-body\"\r\n\
+              X-Stream-Error: failed to decode\r\n\r\n",
         );
-        let headers = decode_trailers(&mut buf, 2).expect("decode_trailers");
+        let headers = decode_trailers(&mut buf, 3).expect("decode_trailers");
         assert_eq!(headers.len(), 2);
-        assert_eq!(
-            headers.get("Expires").unwrap(),
-            "Wed, 21 Oct 2015 07:28:00 GMT"
-        );
+        assert!(!headers.contains_key("Expires"));
+        assert_eq!(headers.get("ETag").unwrap(), "\"generated-after-body\"");
         assert_eq!(headers.get("X-Stream-Error").unwrap(), "failed to decode");
     }
 

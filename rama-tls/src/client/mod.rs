@@ -14,21 +14,24 @@ pub use hello::{ClientHello, ClientHelloExtension, ECHClientHello};
 
 mod parser;
 pub use parser::{
-    extract_sni_from_client_hello_handshake, extract_sni_from_client_hello_record,
-    parse_client_hello, parse_client_hello_handshake,
+    ClientHelloHandshakePrefix, extract_sni_from_client_hello_handshake,
+    extract_sni_from_client_hello_record, parse_client_hello, parse_client_hello_handshake,
+    parse_client_hello_handshake_prefix,
 };
 
 mod config;
 #[doc(inline)]
 pub use config::{
-    ClientAuth, ClientAuthData, ServerVerifyMode, TlsClientAuth, TlsClientConfig, TlsServerCertPin,
-    TlsServerCertPinCheck, TlsServerCertPinSet, TlsServerCertPins, TlsServerName,
-    TlsServerTrustAnchors, TlsServerVerify, TlsStoreServerCertChain,
+    ClientAuth, ClientAuthData, ServerTrustRoots, ServerVerifyMode, TlsClientAuth, TlsClientConfig,
+    TlsServerCertPin, TlsServerCertPinCheck, TlsServerCertPinSet, TlsServerCertPins,
+    TlsServerIdentity, TlsServerName, TlsServerTrust, TlsServerTrustAnchors, TlsServerVerify,
+    TlsStoreServerCertChain,
 };
 use rama_crypto::pki_types::CertificateDer;
 
-use super::{ApplicationProtocol, ProtocolVersion};
+use super::ProtocolVersion;
 use rama_core::extensions::Extension;
+use rama_net::tls::ApplicationProtocol;
 
 #[derive(Debug, Clone, Extension)]
 #[extension(tags(tls))]

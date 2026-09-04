@@ -14,7 +14,7 @@ use rama_core::futures::Stream;
 use rama_core::futures::StreamExt as _;
 use rama_core::futures::async_stream::stream_fn;
 use rama_core::futures::stream::BoxStream;
-use rama_core::telemetry::tracing;
+use rama_core::{io::LossyUtf8Reader, telemetry::tracing};
 use rama_net::uri::Uri;
 use tokio::io::AsyncBufRead;
 
@@ -23,9 +23,9 @@ use super::{Rss2Category, Rss2Feed, Rss2Guid, Rss2Image, Rss2Item, Rss2Source};
 use crate::protocols::rss::atom::AtomLink;
 use crate::protocols::rss::atom::names::elem as atom_elem;
 use crate::protocols::rss::error::{CollectError, FeedParseError, Rss2CollectError};
-use crate::protocols::rss::feed_ext::FeedExtensions;
 use crate::protocols::rss::feed_ext::names::attr;
 use crate::protocols::rss::feed_ext::parse::{FeedExtAcc, ItemExtAcc, Ns, classify_ns};
+use crate::protocols::rss::feed_ext::{DublinCoreTermsFeed, FeedExtensions};
 use crate::protocols::rss::parse_util::{
     attr_uri, attr_value, enclosure_from_attrs, end_event_parts, parse_rss2_date, parse_uri,
     push_general_ref, push_text,
@@ -78,6 +78,12 @@ impl Default for Rss2Channel {
 }
 
 impl Rss2Channel {
+    /// Channel-level DCMI Metadata Terms resource relationships (`dcterms:*`).
+    #[must_use]
+    pub fn dublin_core_terms(&self) -> Option<&DublinCoreTermsFeed> {
+        self.extensions.dublin_core_terms.as_deref()
+    }
+
     /// Combine this channel header with an iterator of items into a full feed.
     #[must_use]
     pub fn into_feed_with_items<I>(self, items: I) -> Rss2Feed
@@ -147,7 +153,17 @@ impl Rss2FeedStream {
     where
         R: AsyncBufRead + Unpin + Send + 'static,
     {
-        let mut state = Rss2Reader::new(reader, strict);
+        if strict {
+            Self::from_reader(Rss2Reader::new(reader, true)).await
+        } else {
+            Self::from_reader(Rss2Reader::new(LossyUtf8Reader::new(reader), false)).await
+        }
+    }
+
+    async fn from_reader<R>(mut state: Rss2Reader<R>) -> Result<Self, FeedParseError>
+    where
+        R: AsyncBufRead + Unpin + Send + 'static,
+    {
         let channel = state.read_channel().await?;
         let items: BoxStream<'static, Result<Rss2Item, FeedParseError>> =
             Box::pin(stream_fn(move |mut yielder| async move {
@@ -174,7 +190,6 @@ impl Rss2FeedStream {
 
     /// Split into `(channel, items)` so the caller can map/filter/fold over
     /// the items without giving up the channel.
-    #[must_use]
     pub fn drain(
         self,
     ) -> (
@@ -274,7 +289,7 @@ enum Action {
     Eof,
 }
 
-struct Rss2Reader<R: AsyncBufRead + Unpin + Send> {
+struct Rss2Reader<R> {
     nsr: NsReader<R>,
     buf: Vec<u8>,
     strict: bool,
@@ -308,7 +323,10 @@ struct Rss2Reader<R: AsyncBufRead + Unpin + Send> {
     pending_source_url: Option<Uri>,
 }
 
-impl<R: AsyncBufRead + Unpin + Send> Rss2Reader<R> {
+impl<R> Rss2Reader<R>
+where
+    R: AsyncBufRead + Unpin + Send + 'static,
+{
     fn new(reader: R, strict: bool) -> Self {
         let mut nsr = NsReader::from_reader(reader);
         // Do NOT use `trim_text(true)`: quick-xml 0.40 splits a text run around
@@ -425,7 +443,7 @@ impl<R: AsyncBufRead + Unpin + Send> Rss2Reader<R> {
                 self.depth += 1;
                 let ns = classify_ns(&rr);
                 let local_name = e.local_name();
-                let local = std::str::from_utf8(local_name.as_ref()).unwrap_or("");
+                let local = local_name.as_ref();
                 self.text_buf.clear();
 
                 let consumed = if self.in_item {
@@ -517,7 +535,7 @@ impl<R: AsyncBufRead + Unpin + Send> Rss2Reader<R> {
             Event::Empty(e) => {
                 let ns = classify_ns(&rr);
                 let local_name = e.local_name();
-                let local = std::str::from_utf8(local_name.as_ref()).unwrap_or("");
+                let local = local_name.as_ref();
 
                 let consumed = if self.in_item {
                     self.item_acc.on_empty(ns, local, &e)
@@ -545,7 +563,7 @@ impl<R: AsyncBufRead + Unpin + Send> Rss2Reader<R> {
                 Ok(Action::Continue)
             }
             Event::Text(e) => {
-                push_text(&mut self.text_buf, &e, self.strict)?;
+                push_text(&mut self.text_buf, &e);
                 Ok(Action::Continue)
             }
             // quick-xml 0.40 surfaces entity references as standalone events
@@ -556,16 +574,7 @@ impl<R: AsyncBufRead + Unpin + Send> Rss2Reader<R> {
                 Ok(Action::Continue)
             }
             Event::CData(e) => {
-                match std::str::from_utf8(e.as_ref()) {
-                    Ok(t) => self.text_buf.push_str(t),
-                    Err(err) => {
-                        if self.strict {
-                            return Err(FeedParseError::new(format!("invalid CDATA: {err}")));
-                        }
-                        tracing::debug!("rss2 stream CDATA utf8 error (lenient): {err}");
-                        self.text_buf.push_str(&String::from_utf8_lossy(e.as_ref()));
-                    }
-                }
+                self.text_buf.push_str(e.as_ref());
                 Ok(Action::Continue)
             }
             Event::End(e) => {

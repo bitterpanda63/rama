@@ -165,14 +165,15 @@ fn harvest_significant_tokens(xml: &[u8]) -> Vec<String> {
     use quick_xml::events::Event;
     use quick_xml::name::ResolveResult;
 
-    const RECOGNISED_NS: &[&[u8]] = &[
-        b"http://www.w3.org/2005/Atom",
-        b"http://www.itunes.com/dtds/podcast-1.0.dtd",
-        b"https://podcastindex.org/namespace/1.0",
-        b"http://purl.org/dc/elements/1.1/",
-        b"http://search.yahoo.com/mrss/",
-        b"http://purl.org/rss/1.0/modules/content/",
-        b"http://podlove.org/simple-chapters",
+    const RECOGNISED_NS: &[&str] = &[
+        "http://www.w3.org/2005/Atom",
+        "http://www.itunes.com/dtds/podcast-1.0.dtd",
+        "https://podcastindex.org/namespace/1.0",
+        "http://purl.org/dc/elements/1.1/",
+        "http://purl.org/dc/terms/",
+        "http://search.yahoo.com/mrss/",
+        "http://purl.org/rss/1.0/modules/content/",
+        "http://podlove.org/simple-chapters",
     ];
 
     fn is_recognised(rr: &ResolveResult<'_>) -> bool {
@@ -205,9 +206,7 @@ fn harvest_significant_tokens(xml: &[u8]) -> Vec<String> {
     fn append_general_ref(e: &quick_xml::events::BytesRef<'_>, acc: &mut String) {
         if let Ok(Some(ch)) = e.resolve_char_ref() {
             acc.push(ch);
-        } else if let Ok(name) = e.decode()
-            && let Some(replacement) = quick_xml::escape::resolve_predefined_entity(&name)
-        {
+        } else if let Some(replacement) = quick_xml::escape::resolve_predefined_entity(e.as_ref()) {
             acc.push_str(replacement);
         }
         // Unknown (DTD-defined) entities have no definition here; drop them —
@@ -254,7 +253,7 @@ fn harvest_significant_tokens(xml: &[u8]) -> Vec<String> {
                 return;
             }
             for attr in e.attributes().filter_map(Result::ok) {
-                if attr.key.as_ref().starts_with(b"xmlns") {
+                if attr.key.as_ref().starts_with("xmlns") {
                     continue;
                 }
                 if let Ok(v) = attr.normalized_value(quick_xml::XmlVersion::Implicit1_0) {
@@ -277,14 +276,12 @@ fn harvest_significant_tokens(xml: &[u8]) -> Vec<String> {
                 let recognised = is_recognised(&rr);
                 harvest_attrs(&e, recognised, &mut tokens);
             }
-            // Accumulate decoded text and resolved entities into one run;
-            // `decode()` replaces the removed `unescape()` and the entity
-            // expansion now arrives as the `GeneralRef` arm below.
+            // Accumulate text and resolved entities into one run. The event is
+            // already UTF-8, and entity expansion arrives as the `GeneralRef`
+            // arm below.
             Event::Text(e) => {
-                if *stack.last().unwrap_or(&true)
-                    && let Ok(t) = e.decode()
-                {
-                    text_acc.push_str(&t);
+                if *stack.last().unwrap_or(&true) {
+                    text_acc.push_str(e.as_ref());
                 }
             }
             Event::GeneralRef(e) if *stack.last().unwrap_or(&true) => {
@@ -294,10 +291,8 @@ fn harvest_significant_tokens(xml: &[u8]) -> Vec<String> {
                 // CDATA is its own token (never entity-expanded); flush any
                 // pending text first so the two don't merge.
                 flush_token(&mut text_acc, &mut tokens);
-                if *stack.last().unwrap_or(&true)
-                    && let Ok(s) = std::str::from_utf8(e.as_ref())
-                {
-                    let s = s.trim();
+                if *stack.last().unwrap_or(&true) {
+                    let s = e.as_ref().trim();
                     if !s.is_empty() {
                         tokens.push(s.to_owned());
                     }
@@ -1020,6 +1015,55 @@ async fn typed_stream_header_visible_before_items_and_drain_works() {
     );
     let first = entries.next().await.unwrap().unwrap();
     assert_eq!(first.title.value, "Hello, world");
+}
+
+#[tokio::test]
+async fn lenient_rss_keeps_parsing_after_invalid_utf8_text() {
+    let bytes = b"<?xml version=\"1.0\"?><rss version=\"2.0\"><channel>\
+        <title>feed</title><link>https://example.com</link><description>feed</description>\
+        <item><title>before \xff after</title></item>\
+        <item><title>later</title></item>\
+        </channel></rss>"
+        .to_vec();
+    let reader = tokio::io::BufReader::new(std::io::Cursor::new(bytes));
+
+    let feed = Rss2FeedStream::new(reader)
+        .await
+        .expect("lenient RSS header")
+        .collect()
+        .await
+        .expect("lenient RSS body");
+
+    assert_eq!(feed.items.len(), 2);
+    assert_eq!(
+        feed.items[0].title.as_deref(),
+        Some("before \u{fffd} after")
+    );
+    assert_eq!(feed.items[1].title.as_deref(), Some("later"));
+}
+
+#[tokio::test]
+async fn lenient_atom_keeps_parsing_after_invalid_utf8_text() {
+    let bytes = b"<?xml version=\"1.0\"?><feed xmlns=\"http://www.w3.org/2005/Atom\">\
+        <id>urn:feed</id><title>feed</title><updated>2026-08-27T00:00:00Z</updated>\
+        <entry><id>urn:before</id><title>before \xff after</title>\
+        <updated>2026-08-27T00:00:00Z</updated></entry>\
+        <entry><id>urn:later</id><title>later</title>\
+        <updated>2026-08-27T00:00:00Z</updated></entry>\
+        </feed>"
+        .to_vec();
+    let reader = tokio::io::BufReader::new(std::io::Cursor::new(bytes));
+
+    let feed = AtomFeedStream::new(reader)
+        .await
+        .expect("lenient Atom header")
+        .collect()
+        .await
+        .expect("lenient Atom body");
+
+    assert_eq!(feed.entries.len(), 2);
+    assert_eq!(feed.entries[0].title.value, "before \u{fffd} after");
+    assert_eq!(feed.entries[1].title.value, "later");
 }
 
 /// `collect_filtered` must keep only items the predicate accepts, drop the

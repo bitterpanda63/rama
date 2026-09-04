@@ -149,6 +149,9 @@ Rama supports that through `rama-grpc-build`.
 
 See:
 
+- [`examples/proto/echo.proto`](https://github.com/plabayo/rama/blob/main/examples/proto/echo.proto): the contract, compiled by [`examples/build.rs`](https://github.com/plabayo/rama/blob/main/examples/build.rs)
+- [`examples/src/grpc_echo/echo.rs`](https://github.com/plabayo/rama/blob/main/examples/src/grpc_echo/echo.rs): including the generated stubs
+- [`examples/src/grpc_echo/server.rs`](https://github.com/plabayo/rama/blob/main/examples/src/grpc_echo/server.rs) and [`examples/src/grpc_echo/client.rs`](https://github.com/plabayo/rama/blob/main/examples/src/grpc_echo/client.rs): serving and calling it
 - [`examples/grpc/build.rs`](https://github.com/plabayo/rama/blob/main/examples/grpc/build.rs)
 
 Typical building blocks include:
@@ -158,6 +161,64 @@ Typical building blocks include:
 - `rama::http::grpc::include_proto!(...)`
 
 This gives you generated service traits, client stubs and message types that fit directly into Rama's service model.
+
+## Without Protobuf: Services Defined in Rust
+
+Protobuf is the common case, not a requirement. Two pieces let you define and serve a gRPC service without a `.proto` file or a build script:
+
+- `rama::http::grpc::define_service!` generates the same client and server stubs, from a service definition written directly in Rust (without any build.rs).
+- `rama::http::grpc::serde::SerdeCodec` (de)serializes messages with [serde], so the stubs work with your own types. Note that any custom codec is possible here, so [serde] is not a requirement.
+
+```rust,ignore
+rama::http::grpc::define_service! {
+    package = "rama.examples.echo.v1";
+    codec = JsonCodec;
+
+    /// Echoes back what it is given.
+    service Echo {
+        /// Echo a message once.
+        rpc UnaryEcho(EchoRequest) -> EchoResponse;
+        /// Echo a message once per word it contains.
+        rpc ServerStreamingEcho(EchoRequest) -> stream EchoResponse;
+    }
+}
+```
+
+### Choosing a Codec
+
+`JsonCodec` ships with rama and is what the examples use, but do not read that as a recommendation. It is used because you can read JSON on the wire, which makes the example easy to `curl` and a service easy to debug. JSON is also the slowest and most verbose option.
+
+Any format with a [serde] implementation can be used instead. Implementing `SerdeFormat` for one takes about ten lines:
+
+- **JSON**: readable on the wire, easy to debug, slow and verbose
+- **MessagePack**: same types and derives, binary, much smaller and faster, and still easy to read from other languages
+- **Rust-native formats** such as postcard or bincode: smaller and faster again, but only Rust can read them
+
+All of these can stay backwards compatible: use optional fields, defaults, and ignore unknown fields. The difference with protobuf is that protobuf enforces this with field numbers, while here it is up to you.
+
+### Protobuf or Not
+
+Use serde when your types are Rust types. You derive `Serialize` and `Deserialize` on the types you already have, and those go on the wire as they are.
+
+With protobuf every message is a generated type. If you already have your own types, you write conversion code both ways and keep it in sync. Rust enums show this best: an enum where some variants carry data works out of the box with serde, while protobuf needs a `oneof` next to an enum, which is more schema and more conversion code.
+
+Skipping protobuf also means no build step: no `protoc`, no build script, no generated files. That makes a service quicker to change.
+
+Use protobuf when other languages talk to your service. A `.proto` file is a contract they can generate code from, and that is worth a lot. It is the one thing serde cannot give you.
+
+Either way, gRPC does not negotiate content types, so both ends of a route need the same codec.
+
+In short: Rust on both ends is easier without protobuf, anything polyglot wants protobuf.
+
+See:
+
+- [`examples/src/grpc_json_echo/echo.rs`](https://github.com/plabayo/rama/blob/main/examples/src/grpc_json_echo/echo.rs): the service definition
+- [`examples/src/grpc_json_echo/server.rs`](https://github.com/plabayo/rama/blob/main/examples/src/grpc_json_echo/server.rs): serving it
+- [`examples/src/grpc_json_echo/client.rs`](https://github.com/plabayo/rama/blob/main/examples/src/grpc_json_echo/client.rs): calling it
+
+Its sibling [`examples/src/grpc_echo`](https://github.com/plabayo/rama/tree/main/examples/src/grpc_echo) defines the very same `Echo` service from a `.proto` contract, which makes the two flows easy to compare.
+
+[serde]: https://serde.rs
 
 ## Health Checking
 
@@ -175,6 +236,29 @@ The health example combines:
 - a `GrpcRouter`
 
 This is a good real-world pattern because production deployments often need more than a single bare service.
+
+## HTTP and gRPC on One Web Router
+
+An internal service often needs two different interfaces: generated gRPC APIs for machine
+clients, and ordinary HTTP endpoints for operators, infrastructure probes or a small dashboard.
+Rama can serve both from the same `rama_http::service::web::Router` and the same
+`HttpServer::auto` listener.
+
+Import `rama::http::grpc::service::web::RouterExt` to register each generated service
+directly alongside the router's ordinary HTTP routes. Its `with_grpc_service` method consumes
+and returns the router, while `set_grpc_service` is available when building a router mutably.
+
+`with_grpc_service` derives `/<package>.<Service>/{method}` from `NamedService::NAME`.
+It uses a regular POST route so the generated server receives the complete canonical gRPC URI;
+there is no artificial `/grpc` prefix to configure and no nested prefix is stripped.
+
+See the complete job-service example:
+
+- [`examples/proto/jobs.proto`](https://github.com/plabayo/rama/blob/main/examples/proto/jobs.proto): generated job API with unary and server-streaming RPCs
+- [`examples/src/http_grpc_job/jobs.rs`](https://github.com/plabayo/rama/blob/main/examples/src/http_grpc_job/jobs.rs): generated protobuf types and service stubs
+- [`examples/src/http_grpc_job/common.rs`](https://github.com/plabayo/rama/blob/main/examples/src/http_grpc_job/common.rs): typed HTTP contracts, shared route constants and URI construction
+- [`examples/src/http_grpc_job/server.rs`](https://github.com/plabayo/rama/blob/main/examples/src/http_grpc_job/server.rs): HTTP endpoints, job and standard gRPC health services on one router
+- [`examples/src/http_grpc_job/client.rs`](https://github.com/plabayo/rama/blob/main/examples/src/http_grpc_job/client.rs): CLI for exploring the ordinary HTTP and generated gRPC APIs
 
 ## Compression and Streaming
 
@@ -234,6 +318,8 @@ The most relevant example entry points are:
 - [`examples/grpc/src/helloworld/server.rs`](https://github.com/plabayo/rama/blob/main/examples/grpc/src/helloworld/server.rs): minimal gRPC server
 - [`examples/grpc/src/helloworld/client.rs`](https://github.com/plabayo/rama/blob/main/examples/grpc/src/helloworld/client.rs): minimal gRPC client
 - [`examples/grpc/src/health/server.rs`](https://github.com/plabayo/rama/blob/main/examples/grpc/src/health/server.rs): health reporting and `GrpcRouter`
+- [`examples/src/http_grpc_job/server.rs`](https://github.com/plabayo/rama/blob/main/examples/src/http_grpc_job/server.rs): HTTP and multiple gRPC services on one web router and listener
+- [`examples/src/http_grpc_job/client.rs`](https://github.com/plabayo/rama/blob/main/examples/src/http_grpc_job/client.rs): unary and server-streaming calls against the mixed router
 - [`examples/grpc/src/compression/server.rs`](https://github.com/plabayo/rama/blob/main/examples/grpc/src/compression/server.rs): compression support
 - [`examples/grpc/src/compression/client.rs`](https://github.com/plabayo/rama/blob/main/examples/grpc/src/compression/client.rs): compression-aware client
 - [`examples/grpc/src/gcp/README.md`](https://github.com/plabayo/rama/blob/main/examples/grpc/src/gcp/README.md): more realistic remote API usage
@@ -243,7 +329,8 @@ If you want to start with the shortest path:
 1. run the hello world server
 2. run the hello world client
 3. inspect the health example
-4. move on to the streaming and compression examples
+4. run the combined HTTP and gRPC job service
+5. move on to the streaming and compression examples
 
 That sequence gives you a practical ramp from "typed RPC over the network" to "production-leaning gRPC service composition in Rama".
 

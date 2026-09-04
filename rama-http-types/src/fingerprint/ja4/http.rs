@@ -12,7 +12,6 @@
 //! > - <https://github.com/FoxIO-LLC/ja4#licensing>
 //! > - <https://github.com/FoxIO-LLC/ja4/blob/main/License%20FAQ.md>
 
-use itertools::Itertools as _;
 use std::fmt::{self, Write};
 
 use crate::{
@@ -20,7 +19,7 @@ use crate::{
     header::{ACCEPT_LANGUAGE, COOKIE, REFERER},
 };
 
-use crate::fingerprint::{HttpRequestInput, HttpRequestProvider};
+use crate::fingerprint::HttpRequestProvider;
 
 #[derive(Clone)]
 /// Input data for a "ja4h" hash.
@@ -42,14 +41,14 @@ impl Ja4H {
     ///
     /// As specified by <https://blog.foxio.io/ja4%2B-network-fingerprinting>
     /// and reference implementations found at <https://github.com/FoxIO-LLC/ja4>.
+    #[expect(
+        clippy::needless_pass_by_value,
+        reason = "preserve the API accepting owned HttpRequestInput values"
+    )]
     pub fn compute(req: impl HttpRequestProvider) -> Result<Self, Ja4HComputeError> {
-        let HttpRequestInput {
-            header_map,
-            http_method,
-            version,
-        } = req.http_request_input();
+        let (header_map, http_method, version) = req.http_request_input();
 
-        let req_method = HttpRequestMethod::from(http_method);
+        let req_method = HttpRequestMethod::from(http_method.clone());
         let version: HttpVersion = version.try_into()?;
 
         let mut has_cookie_header = false;
@@ -59,9 +58,9 @@ impl Ja4H {
         let mut cookie_pairs = None;
 
         let headers: Vec<_> = header_map
-            .into_ordered_iter()
+            .ordered_iter()
             .filter_map(|(name, value)| {
-                let header_name = &name;
+                let header_name = name;
                 if header_name == ACCEPT_LANGUAGE {
                     language = std::str::from_utf8(value.as_bytes())
                         .ok()
@@ -137,30 +136,67 @@ impl Ja4H {
             None => write!(f, "0000")?,
         }
 
-        // application fingerprint: part II
+        // Application fingerprint parts II-IV. Write each list directly into
+        // either the final formatter or the hash state so the unhashed
+        // intermediate strings are never allocated.
         debug_assert!(
             !self.headers.is_empty(),
             "validated in Ja4H::compute constructor"
         );
-        let headers = self.headers.iter().join(",");
-
-        // website cookie fingerprint
-        let cookie_names = joined_cookie_names(self.cookie_pairs.iter().flatten());
-
-        // user cookie fingerprint
-        let cookie_pairs = joined_cookie_pairs(self.cookie_pairs.iter().flatten());
-
+        f.write_char('_')?;
         if hash_chunks {
-            write!(
-                f,
-                "_{}_{}_{}",
-                hash12(headers),
-                hash12(cookie_names),
-                hash12(cookie_pairs),
-            )
+            write_hash12(f, |writer| self.write_headers(writer))?;
+            f.write_char('_')?;
+            write_hash12(f, |writer| self.write_cookie_names(writer))?;
+            f.write_char('_')?;
+            write_hash12(f, |writer| self.write_cookie_pairs(writer))
         } else {
-            write!(f, "_{headers}_{cookie_names}_{cookie_pairs}")
+            self.write_headers(f)?;
+            f.write_char('_')?;
+            self.write_cookie_names(f)?;
+            f.write_char('_')?;
+            self.write_cookie_pairs(f)
         }
+    }
+
+    fn write_headers(&self, writer: &mut (impl fmt::Write + ?Sized)) -> fmt::Result {
+        let mut first = true;
+        for header in &self.headers {
+            if !first {
+                writer.write_char(',')?;
+            }
+            first = false;
+            writer.write_str(header)?;
+        }
+        Ok(())
+    }
+
+    fn write_cookie_names(&self, writer: &mut (impl fmt::Write + ?Sized)) -> fmt::Result {
+        let mut has_output = false;
+        for (name, _) in self.cookie_pairs.iter().flatten() {
+            if has_output {
+                writer.write_char(',')?;
+            }
+            writer.write_str(name)?;
+            has_output |= !name.is_empty();
+        }
+        Ok(())
+    }
+
+    fn write_cookie_pairs(&self, writer: &mut (impl fmt::Write + ?Sized)) -> fmt::Result {
+        let mut has_output = false;
+        for (name, value) in self.cookie_pairs.iter().flatten() {
+            if has_output {
+                writer.write_char(',')?;
+            }
+            writer.write_str(name)?;
+            if let Some(value) = value {
+                writer.write_char('=')?;
+                writer.write_str(value)?;
+            }
+            has_output |= !name.is_empty() || value.is_some();
+        }
+        Ok(())
     }
 }
 
@@ -191,45 +227,6 @@ fn format_str_truncate(n: usize, s: &str, f: &mut fmt::Formatter) -> fmt::Result
     Ok(())
 }
 
-fn joined_cookie_names<'a, I>(cookie_pairs: I) -> String
-where
-    I: IntoIterator<Item = &'a (String, Option<String>)>,
-{
-    // Write into a single growing buffer; avoids one per-element `to_owned`
-    // allocation in the JA4H hot path.
-    let mut out = String::new();
-    for (name, _) in cookie_pairs {
-        debug_assert!(!name.is_empty());
-        if !out.is_empty() {
-            out.push(',');
-        }
-        out.push_str(name);
-    }
-    out
-}
-
-fn joined_cookie_pairs<'a, I>(cookie_pairs: I) -> String
-where
-    I: IntoIterator<Item = &'a (String, Option<String>)>,
-{
-    // Same rationale as `joined_cookie_names` — we previously allocated a
-    // fresh `String` per cookie via `format!("{name}={value}")` before the
-    // final join. Now everything is appended into a single buffer.
-    let mut out = String::new();
-    for (name, value) in cookie_pairs {
-        debug_assert!(!name.is_empty());
-        if !out.is_empty() {
-            out.push(',');
-        }
-        out.push_str(name);
-        if let Some(value) = value {
-            out.push('=');
-            out.push_str(value);
-        }
-    }
-    out
-}
-
 #[derive(Debug, Clone)]
 /// error identifying a failure in [`Ja4H::compute`]
 pub enum Ja4HComputeError {
@@ -254,7 +251,7 @@ impl fmt::Display for Ja4HComputeError {
 
 impl std::error::Error for Ja4HComputeError {}
 
-use super::hash12;
+use super::write_hash12;
 
 #[derive(Debug, Clone, PartialEq)]
 struct HttpRequestMethod(Method);
@@ -329,7 +326,7 @@ impl fmt::Display for HttpVersion {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{HeaderMap, Request};
+    use crate::{HeaderMap, Request, fingerprint::HttpRequestInput};
 
     #[derive(Debug)]
     struct TestCase {
@@ -452,5 +449,49 @@ mod tests {
                 test_case.description
             );
         }
+    }
+
+    #[test]
+    fn test_ja4h_ignores_empty_cookie_segments_and_separates_valueless_cookies() {
+        let req = Request::builder()
+            .method(Method::GET)
+            .version(Version::HTTP_11)
+            .header("Host", "example.com")
+            .header("Cookie", "; alpha; bravo=charlie")
+            .body(())
+            .unwrap();
+
+        let ja4h = Ja4H::compute(&req).unwrap();
+
+        assert_eq!(
+            format!("{ja4h:?}"),
+            "ge11cn010000_Host_alpha,bravo_alpha,bravo=charlie"
+        );
+    }
+
+    #[test]
+    fn test_ja4h_accepts_request_parts_and_owned_input() {
+        let req = Request::builder()
+            .method(Method::GET)
+            .version(Version::HTTP_11)
+            .header("Host", "example.com")
+            .header("Accept", "text/html")
+            .body(())
+            .unwrap();
+        let expected = Ja4H::compute(&req).unwrap();
+        let (parts, ()) = req.into_parts();
+
+        let actual = Ja4H::compute(&parts).unwrap();
+        let from_owned_input = Ja4H::compute(HttpRequestInput {
+            header_map: parts.headers,
+            http_method: parts.method,
+            version: parts.version,
+        })
+        .unwrap();
+
+        assert_eq!(format!("{actual:?}"), format!("{expected:?}"));
+        assert_eq!(format!("{actual}"), format!("{expected}"));
+        assert_eq!(format!("{from_owned_input:?}"), format!("{expected:?}"));
+        assert_eq!(format!("{from_owned_input}"), format!("{expected}"));
     }
 }

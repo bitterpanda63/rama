@@ -6,8 +6,8 @@
 
 pub mod server;
 
-pub mod uri;
-
 mod version;
 #[doc(inline)]
-pub use version::{InvalidVersion, TargetHttpVersion, Version};
+pub use version::{
+    FallbackHttpVersion, HttpRequestVersion, InvalidVersion, TargetHttpVersion, Version,
+};

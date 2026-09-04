@@ -36,7 +36,7 @@ use rama::{
     net::{
         Protocol,
         address::{ProxyAddress, SocketAddress},
-        client::{ConnectorService, EstablishedClientConnection},
+        client::{ConnectorService, EstablishedClientConnection, ProxyRoute},
         user::{ProxyCredential, credentials::basic},
     },
     proxy::socks5::{Socks5Acceptor, Socks5ProxyConnector},
@@ -50,7 +50,7 @@ use rama::{
     tls::boring::{client::TlsConnector, server::TlsAcceptorService},
     tls::{
         client::{ServerVerifyMode, TlsClientConfig},
-        server::{SelfSignedData, TlsServerConfig},
+        server::{GeneratedServerAuthConfig, TlsServerConfig},
     },
 };
 
@@ -93,17 +93,16 @@ async fn main() {
         .body(Body::empty())
         .expect("build simple GET request");
 
-    request.extensions().insert(ProxyAddress {
+    request.extensions().insert(ProxyRoute::Proxy(ProxyAddress {
         protocol: Some(Protocol::SOCKS5),
         address: proxy_socket_addr.into(),
         credential: Some(ProxyCredential::Basic(basic!("john", "secret"))),
-    });
+    }));
 
     let EstablishedClientConnection {
         input: req,
         conn: http_service,
-    } = client
-        .connect(request)
+    } = Box::pin(client.connect(request))
         .await
         .expect("establish a proxied connection ready to make http requests");
 
@@ -129,7 +128,7 @@ async fn main() {
 
 async fn spawn_socks5_over_tls_server() -> SocketAddress {
     let tcp_service =
-        TcpListener::bind_address(SocketAddress::default_ipv4(63011), Executor::default())
+        TcpListener::bind_address(SocketAddress::local_ipv4(63011), Executor::default())
             .await
             .expect("bind socks5-over-tls CONNECT proxy on open port");
 
@@ -142,7 +141,7 @@ async fn spawn_socks5_over_tls_server() -> SocketAddress {
         Socks5Acceptor::default().with_authorizer(basic!("john", "secret").into_authorizer());
 
     let tls_server_config = TlsServerConfig::new()
-        .try_with_self_signed(SelfSignedData::default())
+        .try_with_generated_server_auth(GeneratedServerAuthConfig::default())
         .expect("self-signed");
 
     let secure_socks5_acceptor = TlsAcceptorService::new(tls_server_config, socks5_acceptor, false);
@@ -154,7 +153,7 @@ async fn spawn_socks5_over_tls_server() -> SocketAddress {
 
 async fn spawn_http_server() -> SocketAddress {
     let tcp_service =
-        TcpListener::bind_address(SocketAddress::default_ipv4(63012), Executor::default())
+        TcpListener::bind_address(SocketAddress::local_ipv4(63012), Executor::default())
             .await
             .expect("bind HTTP server on open port");
 

@@ -1,17 +1,21 @@
 use itertools::Itertools;
 use rama_boring::x509::store::X509Store;
 use rama_core::conversion::RamaFrom;
-use rama_core::extensions::{Extension, FromExtensions};
+use rama_core::extensions::{Extension, Extensions, FromExtensions};
+use rama_net::tls::{ApplicationProtocol, TlsAlpn};
 use rama_tls::client::{
     ClientHello, ClientHelloExtension, TlsClientAuth, TlsClientConfig, TlsServerCertPins,
-    TlsServerName, TlsServerTrustAnchors, TlsServerVerify, TlsStoreServerCertChain,
+    TlsServerName, TlsServerTrust, TlsServerVerify, TlsStoreServerCertChain,
 };
 use rama_tls::{
-    ApplicationProtocol, CertificateCompressionAlgorithm, CipherSuite, ExtensionId,
-    ProtocolVersion, SignatureScheme, SupportedGroup, TlsAlpn, TlsKeyLog, TlsSupportedVersions,
+    CertificateCompressionAlgorithm, CipherSuite, ExtensionId, ProtocolVersion, SignatureScheme,
+    SupportedGroup, TlsKeyLog, TlsSupportedVersions,
 };
 use rama_utils::macros::generate_set_and_with;
 use std::sync::Arc;
+
+#[cfg(feature = "http")]
+use rama_utils::collections::smallvec::smallvec;
 
 use crate::RamaTlsBoringCrateMarker;
 
@@ -26,7 +30,7 @@ pub struct BoringTlsConnectorConfig<'a> {
     pub store_chain: Option<&'a TlsStoreServerCertChain>,
     pub client_auth: Option<&'a TlsClientAuth>,
     pub server_cert_pins: Option<&'a TlsServerCertPins>,
-    pub server_trust_anchors: Option<&'a TlsServerTrustAnchors>,
+    pub server_trust: Option<&'a TlsServerTrust>,
     pub cipher_suites: Option<&'a BoringCipherSuites>,
     pub supported_groups: Option<&'a BoringSupportedGroups>,
     pub signature_schemes: Option<&'a BoringSignatureSchemes>,
@@ -106,7 +110,7 @@ pub trait BoringClientConfigExt: Sized {
         /// Set a custom server-certificate verification store (custom CA roots).
         ///
         /// Ignored with [`ServerVerifyMode::Disable`]; takes precedence over
-        /// common server trust anchors.
+        /// common server trust policy.
         ///
         /// [`ServerVerifyMode::Disable`]: rama_tls::client::ServerVerifyMode::Disable
         fn server_verify_cert_store(self, store: Arc<X509Store>) -> Self;
@@ -258,6 +262,75 @@ pub struct BoringAlps {
     pub new_codepoint: bool,
 }
 
+/// Result of coupling a concrete ALPN offer to mirrored ALPS support.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AlpsCoupling {
+    /// The config did not contain ALPS.
+    NotConfigured,
+    /// ALPS was retained for the selected ALPN protocol.
+    Retained,
+    /// ALPS was suppressed because it did not include the selected protocol.
+    Suppressed,
+}
+
+/// Set an ALPN offer and keep inherited ALPS protocols within that offer.
+pub(crate) fn set_alpn_list_with_coupled_alps(
+    extensions: &Extensions,
+    alpn: TlsAlpn,
+) -> AlpsCoupling {
+    let offered = alpn.0.clone();
+    extensions.insert(alpn);
+
+    let Some((protocols, new_codepoint)) = extensions
+        .get_ref::<BoringAlps>()
+        .map(|alps| (alps.protocols.clone(), alps.new_codepoint))
+    else {
+        return AlpsCoupling::NotConfigured;
+    };
+
+    let protocols: Vec<_> = protocols
+        .into_iter()
+        .filter(|protocol| offered.contains(protocol))
+        .collect();
+    let coupling = if protocols.is_empty() {
+        AlpsCoupling::Suppressed
+    } else {
+        AlpsCoupling::Retained
+    };
+    extensions.insert(BoringAlps {
+        protocols,
+        new_codepoint,
+    });
+    coupling
+}
+
+/// Offer exactly one ALPN protocol and keep ALPS coherent with that offer.
+///
+/// ALPS settings are scoped to a negotiated ALPN protocol. BoringSSL requires
+/// every configured ALPS protocol to also occur in its ALPN offer, so callers
+/// which narrow ALPN must update both extensions together. Mirrored ALPS is
+/// retained only when it included `protocol`; otherwise an empty newest value
+/// shadows it in the append-only [`Extensions`] chain. The connector registers
+/// no application settings for that empty value, causing BoringSSL to omit ALPS
+/// from the wire ClientHello.
+///
+/// Suppressing ALPS only forgoes settings exchange inside the TLS handshake. It
+/// does not disable the selected application protocol or its normal settings
+/// exchange after the handshake.
+///
+/// See the [ALPS semantics][alps] and
+/// [BoringSSL application-settings contract][boring-alps].
+///
+/// [alps]: https://datatracker.ietf.org/doc/html/draft-vvv-tls-alps-01#section-3
+/// [boring-alps]: https://boringssl.googlesource.com/boringssl/+/refs/heads/master/include/openssl/ssl.h
+#[cfg(feature = "http")]
+pub(crate) fn set_alpn_with_coupled_alps(
+    extensions: &Extensions,
+    protocol: ApplicationProtocol,
+) -> AlpsCoupling {
+    set_alpn_list_with_coupled_alps(extensions, TlsAlpn(smallvec![protocol]))
+}
+
 /// ClientHello extension ordering.
 #[derive(Debug, Clone, Extension)]
 #[extension(tags(tls))]
@@ -339,9 +412,8 @@ impl RamaFrom<&ClientHello, RamaTlsBoringCrateMarker> for TlsClientConfig {
 
         for ext in extensions {
             match ext {
-                // SNI is resolved per-request from the target host by the
-                // connector (with the IP-first / RFC 6066 guard), not baked into
-                // the config here.
+                // The server identity is resolved per request from the target
+                // host, rather than copied from the observed ClientHello.
                 ClientHelloExtension::ServerName(_) => {}
                 ClientHelloExtension::ApplicationLayerProtocolNegotiation(alpn) => {
                     config.set_alpn(alpn.clone().into());

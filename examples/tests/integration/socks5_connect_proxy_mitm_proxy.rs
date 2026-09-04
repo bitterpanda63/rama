@@ -19,13 +19,14 @@ use rama::{
     net::{
         Protocol,
         address::{ProxyAddress, SocketAddress},
+        client::ProxyRoute,
         user::{Basic, ProxyCredential},
     },
     rt::Executor,
     tcp::server::TcpListener,
     telemetry::tracing,
     tls::boring::server::TlsAcceptorService,
-    tls::server::{SelfSignedData, TlsServerConfig},
+    tls::server::{GeneratedServerAuthConfig, TlsServerConfig},
     utils::str::non_empty_str,
 };
 
@@ -94,7 +95,7 @@ async fn test_http_client_over_socks5_proxy_connect_with_mitm_cap(
 
         let resp = runner
             .get(uri)
-            .extension(proxy_address.clone())
+            .extension(ProxyRoute::Proxy(proxy_address.clone()))
             .send()
             .await
             .expect("make http(s) request via socks5 proxy")
@@ -111,7 +112,7 @@ async fn test_http_client_over_socks5_proxy_connect_with_mitm_cap(
 
 async fn spawn_http_server() -> SocketAddress {
     let tcp_service =
-        TcpListener::bind_address(SocketAddress::default_ipv4(63009), Executor::default())
+        TcpListener::bind_address(SocketAddress::local_ipv4(63009), Executor::default())
             .await
             .expect("bind HTTP server on open port");
 
@@ -131,7 +132,7 @@ async fn spawn_http_server() -> SocketAddress {
 
 async fn spawn_https_server() -> SocketAddress {
     let tcp_service =
-        TcpListener::bind_address(SocketAddress::default_ipv4(63010), Executor::default())
+        TcpListener::bind_address(SocketAddress::local_ipv4(63010), Executor::default())
             .await
             .expect("bind HTTP server on open port");
 
@@ -145,10 +146,7 @@ async fn spawn_https_server() -> SocketAddress {
         .service((ArcLayer::new(), ErrorHandlerLayer::new()).into_layer(app));
 
     let config = TlsServerConfig::new()
-        .try_with_self_signed(SelfSignedData {
-            organisation_name: Some("Socks5 Https Test Server".to_owned()),
-            ..Default::default()
-        })
+        .try_with_generated_server_auth(GeneratedServerAuthConfig::default())
         .expect("self-signed")
         .with_alpn_http_auto();
     let https_server = TlsAcceptorService::new(config, http_server, false);

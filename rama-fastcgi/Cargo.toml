@@ -27,7 +27,7 @@ targets = [
 
 [features]
 default = ["transport"]
-http = ["dep:rama-http-types", "dep:tokio-util", "rama-net/http"]
+http = ["dep:rama-http-types", "dep:tokio-util"]
 transport = ["dep:rama-tcp", "dep:rama-unix"]
 
 [dependencies]
@@ -44,7 +44,6 @@ rama-unix = { workspace = true, optional = true }
 
 [dev-dependencies]
 parking_lot = { workspace = true }
-tempfile = { workspace = true }
 
 [lints]
 workspace = true

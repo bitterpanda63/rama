@@ -1,27 +1,27 @@
 use rama::{
     crypto::{
-        cert::self_signed_server_auth,
+        cert::generate_server_auth,
         pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject},
     },
-    error::{BoxError, ErrorContext as _},
+    error::{BoxError, BoxErrorExt as _, ErrorContext as _},
     http::tls::CertIssuerHttpClient,
-    net::address::Host,
+    net::{address::Host, tls::ApplicationProtocol},
     rt::Executor,
     telemetry::tracing,
     tls::boring::{
         core::x509::X509,
-        server::{BoringServerConfigExt as _, CacheKind, ServerCertIssuerData},
+        server::{BoringServerConfigExt as _, ServerCertIssuerData},
     },
     tls::{
-        ApplicationProtocol,
         client::TlsServerCertPin,
-        server::{SelfSignedData, ServerAuthData, TlsServerConfig},
+        server::{GeneratedServerAuthConfig, ServerAuthData, TlsServerConfig},
     },
     utils::str::NATIVE_NEWLINE,
 };
 
 use base64::Engine;
 use base64::engine::general_purpose::STANDARD as ENGINE;
+use std::path::Path;
 
 pub fn try_new_server_config(
     alpn: Option<Vec<ApplicationProtocol>>,
@@ -30,10 +30,7 @@ pub fn try_new_server_config(
     let mut config = TlsServerConfig::new();
     match CertIssuerHttpClient::try_from_env(exec) {
         Ok(issuer) => {
-            config.set_cert_issuer(ServerCertIssuerData {
-                kind: issuer.into(),
-                cache_kind: CacheKind::default(),
-            });
+            config.set_cert_issuer(ServerCertIssuerData::new(issuer));
         }
         Err(err) => {
             tracing::debug!("failed to create CertIssuerHttpClient from env: {err}");
@@ -46,9 +43,46 @@ pub fn try_new_server_config(
     Ok(config)
 }
 
+pub fn try_new_server_config_with_auth_files(
+    cert_path: Option<&Path>,
+    key_path: Option<&Path>,
+    alpn: Option<Vec<ApplicationProtocol>>,
+    exec: Executor,
+) -> Result<TlsServerConfig, BoxError> {
+    match (cert_path, key_path) {
+        (Some(cert), Some(key)) => {
+            tracing::info!(
+                cert.path = ?cert,
+                key.path = ?key,
+                "loading TLS certificate from files"
+            );
+
+            let cert_chain = CertificateDer::pem_file_iter(cert)
+                .context("parse cert file")?
+                .collect::<Result<Vec<_>, _>>()
+                .context("collect certificates")?;
+            let private_key =
+                PrivateKeyDer::from_pem_file(key).context("parse private key file")?;
+            let mut config = TlsServerConfig::new().with_single_cert(ServerAuthData {
+                cert_chain,
+                private_key,
+                ocsp: None,
+            });
+            if let Some(alpn) = alpn {
+                config.set_alpn(alpn.into());
+            }
+            Ok(config)
+        }
+        (None, None) => try_new_server_config(alpn, exec),
+        _ => Err(BoxError::from_static_str(
+            "both certificate and key must be provided together, or neither",
+        )),
+    }
+}
+
 fn try_new_server_auth() -> Result<ServerAuthData, BoxError> {
     let Ok(tls_key_pem_raw) = std::env::var("RAMA_TLS_KEY") else {
-        let (cert_chain, private_key) = self_signed_server_auth(SelfSignedData::default())?;
+        let (cert_chain, private_key) = generate_server_auth(GeneratedServerAuthConfig::default())?;
         return Ok(ServerAuthData::new(cert_chain, private_key));
     };
     let tls_key_pem_raw = &ENGINE
@@ -163,11 +197,11 @@ fn fmt_hex(bytes: &[u8], sep: &str, w: &mut impl std::io::Write) -> std::io::Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use rama::crypto::cert::SelfSignedData;
+    use rama::crypto::cert::GeneratedServerAuthConfig;
 
     #[test]
     fn write_cert_info_includes_copyable_key_pin() {
-        let (chain, _) = self_signed_server_auth(SelfSignedData::default()).unwrap();
+        let (chain, _) = generate_server_auth(GeneratedServerAuthConfig::default()).unwrap();
         let leaf = X509::from_der(chain[0].as_ref()).unwrap();
         let expected_pin = TlsServerCertPin::spki_sha256_of(&chain[0]).unwrap();
 

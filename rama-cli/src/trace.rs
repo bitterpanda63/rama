@@ -27,28 +27,37 @@ use rama::{
 use std::{fs::OpenOptions, io::IsTerminal as _, path::Path};
 
 pub fn init_tracing(default_directive: impl Into<Directive>) -> Result<(), BoxError> {
+    init_tracing_with_overrides(default_directive, [])
+}
+
+pub fn init_tracing_with_overrides(
+    default_directive: impl Into<Directive>,
+    overrides: impl IntoIterator<Item = Directive>,
+) -> Result<(), BoxError> {
+    let default_directive = default_directive.into();
+    let overrides: Vec<_> = overrides.into_iter().collect();
     if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_ok() {
-        init_structured(default_directive)
+        init_structured(default_directive, &overrides)
     } else {
-        init_default(default_directive)
+        init_default(default_directive, &overrides)
     }
 }
 
-fn init_default(default_directive: impl Into<Directive>) -> Result<(), BoxError> {
+fn init_default(default_directive: Directive, overrides: &[Directive]) -> Result<(), BoxError> {
     tracing::subscriber::registry()
-        .with(fmt::layer())
         .with(
-            EnvFilter::builder()
-                .with_default_directive(default_directive.into())
-                .from_env_lossy(),
+            fmt::layer()
+                .with_ansi(std::io::stderr().is_terminal())
+                .with_writer(std::io::stderr),
         )
+        .with(env_filter(default_directive, overrides))
         .try_init()
         .context("try init (default) tracing subscriber")?;
 
     Ok(())
 }
 
-fn init_structured(default_directive: impl Into<Directive>) -> Result<(), BoxError> {
+fn init_structured(default_directive: Directive, overrides: &[Directive]) -> Result<(), BoxError> {
     let svc = EasyHttpWebClient::connector_builder()
         .with_default_transport_connector()
         .with_default_dns_connector()
@@ -56,8 +65,7 @@ fn init_structured(default_directive: impl Into<Directive>) -> Result<(), BoxErr
         .without_proxy_support()
         .with_tls_support_using_boringssl(TlsClientConfig::default_http())
         .with_default_http_connector(Executor::default())
-        .try_with_default_connection_pool()
-        .context("build http exporter client service")?
+        .with_default_connection_pool()
         .build_client();
     let exportor = OtelExporter::from_env_http(svc).context("build OTLP HTTP span exporter")?;
 
@@ -89,15 +97,20 @@ fn init_structured(default_directive: impl Into<Directive>) -> Result<(), BoxErr
                 .json()
                 .flatten_event(true),
         )
-        .with(
-            EnvFilter::builder()
-                .with_default_directive(default_directive.into())
-                .from_env_lossy(),
-        )
+        .with(env_filter(default_directive, overrides))
         .try_init()
         .context("try init (structured) tracing subscriber")?;
 
     Ok(())
+}
+
+fn env_filter(default_directive: Directive, overrides: &[Directive]) -> EnvFilter {
+    overrides.iter().cloned().fold(
+        EnvFilter::builder()
+            .with_default_directive(default_directive)
+            .from_env_lossy(),
+        EnvFilter::add_directive,
+    )
 }
 
 pub fn init_tracing_file(path: &Path) -> Result<(), BoxError> {

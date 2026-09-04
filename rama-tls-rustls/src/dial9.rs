@@ -1,25 +1,22 @@
 //! Pre-defined [dial9] events for the rustls client handshake.
 //!
-//! [dial9]: https://github.com/dial9-rs/dial9-tokio-telemetry
+//! [dial9]: https://github.com/dial9-rs/dial9
 
-use dial9_tokio_telemetry::telemetry::{TelemetryHandle, clock_monotonic_ns, record_event};
-use dial9_trace_format::{
-    EventEncoder, TraceEvent, TraceField,
-    types::{FieldType, FieldValueRef},
-};
+use dial9::Dial9Handle;
+use dial9::core::clock_monotonic_ns;
+use dial9_trace_format::{EventEncoder, TraceEvent, TraceField, types::FieldType};
 use rama_net::{
     address::Host,
     dial9::{io_error_kind_code, io_error_raw_os_code},
+    tls::ApplicationProtocol,
 };
-use rama_tls::{ApplicationProtocol, ProtocolVersion};
+use rama_tls::ProtocolVersion;
 use std::io::{self, Write};
 
 #[derive(Debug, Clone)]
 pub struct MaybeAlpnSelected(Option<ApplicationProtocol>);
 
 impl TraceField for MaybeAlpnSelected {
-    type Ref<'a> = &'a [u8];
-
     fn field_type() -> FieldType {
         FieldType::Bytes
     }
@@ -30,13 +27,6 @@ impl TraceField for MaybeAlpnSelected {
             None => enc.write_bytes(&[]),
         }
     }
-
-    fn decode_ref<'a>(val: &FieldValueRef<'a>) -> Option<Self::Ref<'a>> {
-        match val {
-            FieldValueRef::Bytes(bytes) => Some(bytes),
-            _ => None,
-        }
-    }
 }
 
 /// TLS handshake initiation.
@@ -44,7 +34,7 @@ impl TraceField for MaybeAlpnSelected {
 pub struct TlsHandshakeStarted {
     #[traceevent(timestamp)]
     pub timestamp_ns: u64,
-    /// Server name (SNI) the client is negotiating against.
+    /// Server certificate identity the client is negotiating against.
     pub server_name: Host,
 }
 
@@ -76,15 +66,12 @@ pub struct TlsHandshakeFailed {
 
 #[inline]
 pub(crate) fn record_handshake_started(server_name: Host) {
-    let handle = TelemetryHandle::current();
+    let handle = Dial9Handle::current();
     if handle.is_enabled() {
-        record_event(
-            TlsHandshakeStarted {
-                timestamp_ns: clock_monotonic_ns(),
-                server_name,
-            },
-            &handle,
-        );
+        handle.record_event(TlsHandshakeStarted {
+            timestamp_ns: clock_monotonic_ns(),
+            server_name,
+        });
     }
 }
 
@@ -95,33 +82,27 @@ pub(crate) fn record_handshake_completed(
     alpn_selected: Option<ApplicationProtocol>,
     peer_cert_chain_depth: usize,
 ) {
-    let handle = TelemetryHandle::current();
+    let handle = Dial9Handle::current();
     if handle.is_enabled() {
-        record_event(
-            TlsHandshakeCompleted {
-                timestamp_ns: clock_monotonic_ns(),
-                server_name,
-                protocol_version,
-                alpn_selected: MaybeAlpnSelected(alpn_selected),
-                peer_cert_chain_depth: u32::try_from(peer_cert_chain_depth).unwrap_or(u32::MAX),
-            },
-            &handle,
-        );
+        handle.record_event(TlsHandshakeCompleted {
+            timestamp_ns: clock_monotonic_ns(),
+            server_name,
+            protocol_version,
+            alpn_selected: MaybeAlpnSelected(alpn_selected),
+            peer_cert_chain_depth: u32::try_from(peer_cert_chain_depth).unwrap_or(u32::MAX),
+        });
     }
 }
 
 #[inline]
 pub(crate) fn record_handshake_failed(server_name: Host, error: &std::io::Error) {
-    let handle = TelemetryHandle::current();
+    let handle = Dial9Handle::current();
     if handle.is_enabled() {
-        record_event(
-            TlsHandshakeFailed {
-                timestamp_ns: clock_monotonic_ns(),
-                server_name,
-                error_kind: io_error_kind_code(error.kind()),
-                error_raw_os: io_error_raw_os_code(error),
-            },
-            &handle,
-        );
+        handle.record_event(TlsHandshakeFailed {
+            timestamp_ns: clock_monotonic_ns(),
+            server_name,
+            error_kind: io_error_kind_code(error.kind()),
+            error_raw_os: io_error_raw_os_code(error),
+        });
     }
 }

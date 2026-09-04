@@ -1,8 +1,8 @@
-use std::net::SocketAddr;
+use std::net::IpAddr;
 
 use rama_core::{
     Layer, Service,
-    error::{BoxError, ErrorContext as _},
+    error::{BoxError, BoxErrorExt as _, ErrorContext as _},
     extensions::Extensions,
     futures::{StreamExt, stream::BoxStream},
 };
@@ -10,7 +10,8 @@ use rama_net::{
     ConnectorTargetInputExt,
     address::{Domain, Host, HostWithPort},
     client::{
-        AddressCandidates, ConnectorService, ConnectorTargetStream, EstablishedClientConnection,
+        AddressCandidates, ConnectionError, ConnectionErrorKind, ConnectorService,
+        ConnectorTargetStream, EstablishedClientConnection,
     },
 };
 use rama_utils::macros::define_inner_service_accessors;
@@ -106,59 +107,61 @@ where
     R: DnsAddressResolver + Clone,
 {
     type Output = EstablishedClientConnection<S::Connection, Input>;
-    type Error = BoxError;
+    type Error = ConnectionError;
 
     async fn serve(&self, input: Input) -> Result<Self::Output, Self::Error> {
-        let HostWithPort { host, port } = input
-            .connector_target()
-            .context("dns connector: get connector target from input")?;
+        let HostWithPort { host, .. } = input.connector_target().ok_or_else(|| {
+            ConnectionError::local(
+                BoxError::from_static_str("dns connector: connector target missing from input"),
+                ConnectionErrorKind::InvalidInput,
+            )
+        })?;
 
         // Already an IP target: nothing to resolve, forward the input untouched.
         if host.try_as_ip().is_ok() {
-            return self.inner.connect(input).await.map_err(Into::into);
+            return self.inner.connect(input).await;
         }
 
         // Domain target: stamp a lazy candidate source for the transport to
         // resolve + dial, and forward the (untouched) input.
-        let domain = host
-            .try_into_domain()
-            .context("dns connector: connector target host is not resolvable as a domain")?;
+        let domain = host.try_into_domain().map_err(|error| {
+            ConnectionError::local(error, ConnectionErrorKind::InvalidInput)
+                .context("dns connector: connector target host is not resolvable as a domain")
+        })?;
         input
             .extensions()
             .insert(ConnectorTargetStream::new(DnsAddressCandidates {
                 resolver: self.resolver.clone(),
                 domain,
-                port,
             }));
 
-        self.inner.connect(input).await.map_err(Into::into)
+        self.inner.connect(input).await
     }
 }
 
 /// [`AddressCandidates`] backed by a [`DnsAddressResolver`].
 ///
 /// Resolves a domain target into a happy-eyeballs-ordered stream of
-/// [`SocketAddr`]esses.
+/// [`IpAddr`]esses.
 struct DnsAddressCandidates<R> {
     resolver: R,
     domain: Domain,
-    port: u16,
 }
 
 impl<R> AddressCandidates for DnsAddressCandidates<R>
 where
     R: DnsAddressResolver,
 {
-    fn stream<'a>(
-        &'a self,
-        extensions: &'a Extensions,
-    ) -> BoxStream<'a, Result<SocketAddr, BoxError>> {
-        let port = self.port;
+    fn domain(&self) -> &Domain {
+        &self.domain
+    }
+
+    fn stream<'a>(&'a self, extensions: &'a Extensions) -> BoxStream<'a, Result<IpAddr, BoxError>> {
         self.resolver
             .happy_eyeballs_resolver(Host::Name(self.domain.clone()))
             .with_extensions(extensions)
             .lookup_ip()
-            .map(move |result| result.map(|ip| SocketAddr::new(ip, port)).into_box_error())
+            .map(|result| result.into_box_error())
             .boxed()
     }
 }
@@ -172,19 +175,28 @@ mod tests {
     use rama_net::{
         AuthorityInputExt, Protocol, ProtocolInputExt,
         address::{Host, HostWithOptPort, HostWithPort},
+        client::{ConnectionErrorDomain, ConnectionErrorKind},
     };
     use std::sync::Arc;
 
+    #[derive(Debug)]
     struct FakeInput {
         extensions: Extensions,
-        authority: HostWithPort,
+        authority: Option<HostWithPort>,
     }
 
     impl FakeInput {
         fn new(authority: HostWithPort) -> Self {
             Self {
                 extensions: Extensions::new(),
-                authority,
+                authority: Some(authority),
+            }
+        }
+
+        fn without_authority() -> Self {
+            Self {
+                extensions: Extensions::new(),
+                authority: None,
             }
         }
     }
@@ -197,7 +209,7 @@ mod tests {
 
     impl AuthorityInputExt for FakeInput {
         fn authority(&self) -> Option<HostWithOptPort> {
-            Some(self.authority.clone().into())
+            self.authority.clone().map(Into::into)
         }
     }
 
@@ -207,7 +219,7 @@ mod tests {
         }
     }
 
-    #[derive(Clone)]
+    #[derive(Clone, Debug)]
     struct TestConn {
         extensions: Extensions,
     }
@@ -262,6 +274,27 @@ mod tests {
                 .get_ref::<ConnectorTargetStream>()
                 .is_some()
         );
+        assert_eq!(
+            out.input
+                .extensions()
+                .get_ref::<ConnectorTargetStream>()
+                .unwrap()
+                .domain(),
+            &Domain::example()
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_target_is_local_invalid_input() {
+        let connector =
+            DnsConnector::with_resolver(RecordingInner::default(), EmptyDnsResolver::new());
+
+        let error = connector
+            .serve(FakeInput::without_authority())
+            .await
+            .expect_err("missing connector target should fail");
+        assert_eq!(error.domain(), ConnectionErrorDomain::Local);
+        assert_eq!(error.kind(), ConnectionErrorKind::InvalidInput);
     }
 
     #[tokio::test]

@@ -217,12 +217,20 @@ where
                                 continue;
                             }
 
-                            // Reserve exactly the chunk size so we never pin more
-                            // connection-level flow-control window than we are
-                            // about to consume. Stash the chunk in `self` so it
-                            // survives the upcoming `poll_capacity` wait even if
-                            // it returns `Poll::Pending`.
-                            me.body_tx.reserve_capacity(len);
+                            // Reserve a minimal claim on the connection-level
+                            // flow-control window rather than the whole chunk. The
+                            // chunk is already in hand, so this still cannot pin
+                            // capacity against a body that never produces data
+                            // (hyper#4003), and h2 raises the request to the buffered
+                            // length inside `send_data`, so the demand eventually
+                            // signalled to the peer is unchanged. Claiming the full
+                            // length up front instead makes every in-flight stream a
+                            // heavyweight claimant while it waits, which is costly
+                            // once the streams on a connection collectively demand
+                            // more than the window the peer advertises. Stash the
+                            // chunk in `self` so it survives the upcoming
+                            // `poll_capacity` wait even if it returns `Poll::Pending`.
+                            me.body_tx.reserve_capacity(1);
                             *me.buffered_data = Some(Peeked {
                                 data: chunk,
                                 is_eos,
@@ -232,6 +240,7 @@ where
                             Ok(trailers) => {
                                 // no more DATA, so give any capacity back
                                 me.body_tx.reserve_capacity(0);
+                                let trailers = filter_allowed_trailers(trailers);
                                 me.body_tx
                                     .send_trailers(trailers)
                                     .map_err(crate::Error::new_body_write)?;
@@ -253,6 +262,22 @@ where
             }
         }
     }
+}
+
+fn filter_allowed_trailers(trailers: HeaderMap) -> HeaderMap {
+    if trailers.keys().all(|name| name.is_allowed_in_trailers()) {
+        return trailers;
+    }
+
+    let mut filtered = HeaderMap::with_capacity(trailers.len());
+    for (name, value) in trailers.into_ordered_iter() {
+        if name.is_allowed_in_trailers() {
+            filtered.append(name, value);
+        } else {
+            debug!("dropping disallowed HTTP/2 trailer field: {name:?}");
+        }
+    }
+    filtered
 }
 
 trait SendStreamExt {
@@ -290,36 +315,68 @@ enum SendBuf<B> {
 impl<B: Buf> Buf for SendBuf<B> {
     #[inline]
     fn remaining(&self) -> usize {
-        match *self {
-            Self::Buf(ref b) => b.remaining(),
-            Self::Cursor(ref c) => Buf::remaining(c),
+        match self {
+            Self::Buf(b) => b.remaining(),
+            Self::Cursor(c) => Buf::remaining(c),
             Self::None => 0,
         }
     }
 
     #[inline]
     fn chunk(&self) -> &[u8] {
-        match *self {
-            Self::Buf(ref b) => b.chunk(),
-            Self::Cursor(ref c) => c.chunk(),
+        match self {
+            Self::Buf(b) => b.chunk(),
+            Self::Cursor(c) => c.chunk(),
             Self::None => &[],
         }
     }
 
     #[inline]
     fn advance(&mut self, cnt: usize) {
-        match *self {
-            Self::Buf(ref mut b) => b.advance(cnt),
-            Self::Cursor(ref mut c) => c.advance(cnt),
+        match self {
+            Self::Buf(b) => b.advance(cnt),
+            Self::Cursor(c) => c.advance(cnt),
             Self::None => {}
         }
     }
 
     fn chunks_vectored<'a>(&'a self, dst: &mut [IoSlice<'a>]) -> usize {
-        match *self {
-            Self::Buf(ref b) => b.chunks_vectored(dst),
-            Self::Cursor(ref c) => c.chunks_vectored(dst),
+        match self {
+            Self::Buf(b) => b.chunks_vectored(dst),
+            Self::Cursor(c) => c.chunks_vectored(dst),
             Self::None => 0,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rama_http_types::HeaderValue;
+
+    #[test]
+    fn filters_h2_trailers_with_the_shared_field_policy() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("content-type", HeaderValue::from_static("text/plain"));
+        trailers.insert("etag", HeaderValue::from_static("\"v1\""));
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+
+        let filtered = filter_allowed_trailers(trailers);
+
+        assert!(!filtered.contains_key("content-type"));
+        assert_eq!(filtered["etag"], "\"v1\"");
+        assert_eq!(filtered["grpc-status"], "0");
+    }
+
+    #[test]
+    fn keeps_allowed_h2_trailer_allocation() {
+        let mut trailers = HeaderMap::new();
+        trailers.insert("grpc-status", HeaderValue::from_static("0"));
+        let capacity = trailers.capacity();
+
+        let filtered = filter_allowed_trailers(trailers);
+
+        assert_eq!(filtered.capacity(), capacity);
+        assert_eq!(filtered["grpc-status"], "0");
     }
 }

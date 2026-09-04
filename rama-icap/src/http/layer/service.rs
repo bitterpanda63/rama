@@ -1,0 +1,841 @@
+use std::{borrow::Cow, collections::VecDeque, future::poll_fn, pin::Pin, sync::Arc};
+
+use rama_core::{
+    Layer, Service,
+    bytes::Bytes,
+    error::{BoxError, BoxErrorExt as _, ErrorContext as _, ErrorExt as _},
+    extensions::{Extension, ExtensionsRef},
+    futures::{StreamExt as _, stream},
+    io::Io,
+};
+use rama_http_types::{
+    Body, Request as HttpRequest, Response as HttpResponse,
+    body::{Frame, StreamingBody, util::BodyStream},
+    header as http_header,
+};
+use rama_net::client::{ConnectRequest, ConnectorService, EstablishedClientConnection};
+use rama_utils::macros::{define_inner_service_accessors, generate_set_and_with};
+
+use super::{
+    endpoint::ServiceEndpoint,
+    headers::{normalize_request_authority, sanitize_adapted_http_headers},
+};
+use crate::{
+    client::{
+        ClientConnection,
+        options::{
+            MethodSupport, OptionsCache, OptionsCacheHandle, OptionsRequest, ServiceCapabilities,
+            TransferDisposition,
+        },
+    },
+    http::{
+        ClientRequest, ReplayLimits,
+        headers::{SanitizedHttpHead, restore_proxy_header},
+    },
+    message::Response as IcapResponse,
+    proto::{Method, header},
+};
+
+/// Marker service used when automatic OPTIONS discovery is disabled.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct NoOptionsDiscovery;
+
+impl Service<OptionsRequest> for NoOptionsDiscovery {
+    type Output = Arc<ServiceCapabilities>;
+    type Error = BoxError;
+
+    async fn serve(&self, _input: OptionsRequest) -> Result<Self::Output, Self::Error> {
+        Err(BoxError::from_static_str(
+            "ICAP OPTIONS discovery is disabled",
+        ))
+    }
+}
+
+/// ICAP metadata returned by the REQMOD service.
+#[derive(Clone, Debug, Extension)]
+pub struct ReqmodResult(IcapResponse);
+
+impl ReqmodResult {
+    /// Return the ICAP response metadata.
+    #[must_use]
+    pub const fn response(&self) -> &IcapResponse {
+        &self.0
+    }
+}
+
+/// ICAP metadata returned by the RESPMOD service.
+#[derive(Clone, Debug, Extension)]
+pub struct RespmodResult(IcapResponse);
+
+impl RespmodResult {
+    /// Return the ICAP response metadata.
+    #[must_use]
+    pub const fn response(&self) -> &IcapResponse {
+        &self.0
+    }
+}
+
+/// Policy for a configured adaptation direction that OPTIONS explicitly does
+/// not advertise.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum UnsupportedMethodPolicy {
+    /// Treat the unsupported configured direction as an error.
+    #[default]
+    Error,
+    /// Bypass only the unsupported direction.
+    Bypass,
+}
+
+/// Rama layer that detours HTTP requests and responses through ICAP.
+#[derive(Debug)]
+pub struct AdaptationLayer<C, D = NoOptionsDiscovery> {
+    client: C,
+    options: Option<D>,
+    options_cache: Option<OptionsCacheHandle>,
+    request_service: Option<ServiceEndpoint>,
+    response_service: Option<ServiceEndpoint>,
+    unsupported_method_policy: UnsupportedMethodPolicy,
+}
+
+impl<C, D> Clone for AdaptationLayer<C, D>
+where
+    C: Clone,
+    D: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            client: self.client.clone(),
+            options: self.options.clone(),
+            options_cache: self.options_cache.clone(),
+            request_service: self.request_service.clone(),
+            response_service: self.response_service.clone(),
+            unsupported_method_policy: self.unsupported_method_policy,
+        }
+    }
+}
+
+impl<C> AdaptationLayer<C, NoOptionsDiscovery> {
+    /// Create a layer using `client` to establish ICAP connections.
+    pub fn new(client: C) -> Self {
+        Self {
+            client,
+            options: None,
+            options_cache: None,
+            request_service: None,
+            response_service: None,
+            unsupported_method_policy: UnsupportedMethodPolicy::Error,
+        }
+    }
+}
+
+impl<C, D> AdaptationLayer<C, D> {
+    /// Enable automatic OPTIONS discovery through `options`.
+    ///
+    /// A provider may return either an owned capability snapshot or an `Arc`.
+    /// Use [`Self::with_options_cache`] for the built-in cache and automatic
+    /// ISTag invalidation.
+    pub fn with_options_service<D2>(self, options: D2) -> AdaptationLayer<C, D2> {
+        AdaptationLayer {
+            client: self.client,
+            options: Some(options),
+            options_cache: None,
+            request_service: self.request_service,
+            response_service: self.response_service,
+            unsupported_method_policy: self.unsupported_method_policy,
+        }
+    }
+
+    /// Enable cached automatic OPTIONS discovery and ISTag observation.
+    ///
+    /// When a completed adaptation response carries a different ISTag than
+    /// the cached capabilities used for it, the cache is invalidated for
+    /// future transactions. The completed transaction is never retried.
+    pub fn with_options_cache<D2>(
+        self,
+        options: OptionsCache<D2>,
+    ) -> AdaptationLayer<C, OptionsCache<D2>> {
+        let options_cache = Some(options.handle());
+        AdaptationLayer {
+            client: self.client,
+            options: Some(options),
+            options_cache,
+            request_service: self.request_service,
+            response_service: self.response_service,
+            unsupported_method_policy: self.unsupported_method_policy,
+        }
+    }
+
+    /// Enable OPTIONS discovery through a service wrapped around a built-in
+    /// cache while retaining automatic ISTag invalidation.
+    ///
+    /// This is useful for post-cache policy observers: expensive work in the
+    /// outer service does not extend the cache's per-key single-flight
+    /// section, while completed adaptation responses can still invalidate the
+    /// underlying capability snapshot.
+    pub fn with_options_service_and_cache_handle<D2>(
+        self,
+        options: D2,
+        options_cache: OptionsCacheHandle,
+    ) -> AdaptationLayer<C, D2> {
+        AdaptationLayer {
+            client: self.client,
+            options: Some(options),
+            options_cache: Some(options_cache),
+            request_service: self.request_service,
+            response_service: self.response_service,
+            unsupported_method_policy: self.unsupported_method_policy,
+        }
+    }
+
+    /// Return the optional OPTIONS discovery service.
+    #[must_use]
+    pub fn options_service(&self) -> Option<&D> {
+        self.options.as_ref()
+    }
+
+    generate_set_and_with! {
+        /// Set the optional REQMOD service.
+        pub fn request_service(
+            mut self,
+            service: Option<ServiceEndpoint>,
+        ) -> Self {
+            self.request_service = service;
+            self
+        }
+    }
+
+    /// Return the optional REQMOD service.
+    #[must_use]
+    pub const fn request_service(&self) -> Option<&ServiceEndpoint> {
+        self.request_service.as_ref()
+    }
+
+    generate_set_and_with! {
+        /// Set the optional RESPMOD service.
+        ///
+        /// This adapts origin responses. Responses returned directly by a
+        /// REQMOD service are considered final and bypass RESPMOD.
+        pub fn response_service(
+            mut self,
+            service: Option<ServiceEndpoint>,
+        ) -> Self {
+            self.response_service = service;
+            self
+        }
+    }
+
+    /// Return the optional RESPMOD service.
+    #[must_use]
+    pub const fn response_service(&self) -> Option<&ServiceEndpoint> {
+        self.response_service.as_ref()
+    }
+
+    generate_set_and_with! {
+        /// Set how OPTIONS-declared unsupported adaptation directions behave.
+        pub const fn unsupported_method_policy(
+            mut self,
+            policy: UnsupportedMethodPolicy,
+        ) -> Self {
+            self.unsupported_method_policy = policy;
+            self
+        }
+    }
+
+    /// Return the configured unsupported-method policy.
+    #[must_use]
+    pub const fn unsupported_method_policy(&self) -> UnsupportedMethodPolicy {
+        self.unsupported_method_policy
+    }
+}
+
+impl<C, D, S> Layer<S> for AdaptationLayer<C, D>
+where
+    C: Clone,
+    D: Clone,
+{
+    type Service = Adaptation<S, C, D>;
+
+    fn layer(&self, inner: S) -> Self::Service {
+        Adaptation {
+            inner,
+            client: self.client.clone(),
+            options: self.options.clone(),
+            options_cache: self.options_cache.clone(),
+            request_service: self.request_service.clone(),
+            response_service: self.response_service.clone(),
+            unsupported_method_policy: self.unsupported_method_policy,
+        }
+    }
+
+    fn into_layer(self, inner: S) -> Self::Service {
+        Adaptation {
+            inner,
+            client: self.client,
+            options: self.options,
+            options_cache: self.options_cache,
+            request_service: self.request_service,
+            response_service: self.response_service,
+            unsupported_method_policy: self.unsupported_method_policy,
+        }
+    }
+}
+
+/// HTTP service produced by [`AdaptationLayer`].
+#[derive(Debug)]
+pub struct Adaptation<S, C, D = NoOptionsDiscovery> {
+    inner: S,
+    client: C,
+    options: Option<D>,
+    options_cache: Option<OptionsCacheHandle>,
+    request_service: Option<ServiceEndpoint>,
+    response_service: Option<ServiceEndpoint>,
+    unsupported_method_policy: UnsupportedMethodPolicy,
+}
+
+impl<S, C, D> Clone for Adaptation<S, C, D>
+where
+    S: Clone,
+    C: Clone,
+    D: Clone,
+{
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            client: self.client.clone(),
+            options: self.options.clone(),
+            options_cache: self.options_cache.clone(),
+            request_service: self.request_service.clone(),
+            response_service: self.response_service.clone(),
+            unsupported_method_policy: self.unsupported_method_policy,
+        }
+    }
+}
+
+impl<S, C, D> Adaptation<S, C, D> {
+    define_inner_service_accessors!();
+
+    /// Return the ICAP client connector.
+    #[must_use]
+    pub fn client(&self) -> &C {
+        &self.client
+    }
+
+    /// Return the optional OPTIONS discovery service.
+    #[must_use]
+    pub fn options_service(&self) -> Option<&D> {
+        self.options.as_ref()
+    }
+
+    /// Return the optional REQMOD service.
+    #[must_use]
+    pub const fn request_service(&self) -> Option<&ServiceEndpoint> {
+        self.request_service.as_ref()
+    }
+
+    /// Return the optional RESPMOD service.
+    #[must_use]
+    pub const fn response_service(&self) -> Option<&ServiceEndpoint> {
+        self.response_service.as_ref()
+    }
+}
+
+impl<S, C, D, IO, RequestBody, ResponseBody> Service<HttpRequest<RequestBody>>
+    for Adaptation<S, C, D>
+where
+    S: Service<HttpRequest<Body>, Output = HttpResponse<ResponseBody>>,
+    S::Error: Into<BoxError>,
+    C: ConnectorService<ConnectRequest, Connection = ClientConnection<IO>>,
+    D: Service<OptionsRequest>,
+    D::Output: Into<Arc<ServiceCapabilities>>,
+    D::Error: Into<BoxError>,
+    IO: Io + Unpin + ExtensionsRef,
+    RequestBody: StreamingBody<Data = Bytes, Error: Into<BoxError>> + Send + Sync + 'static,
+    ResponseBody: StreamingBody<Data = Bytes, Error: Into<BoxError>> + Send + Sync + 'static,
+{
+    type Output = HttpResponse<Body>;
+    type Error = BoxError;
+
+    async fn serve(&self, request: HttpRequest<RequestBody>) -> Result<Self::Output, Self::Error> {
+        let request = request.map(Body::new);
+        let request = if let Some(service) = &self.request_service {
+            let capabilities = discover(self.options.as_ref(), service).await?;
+            adapt_request(
+                &self.client,
+                self.options_cache.as_ref(),
+                service,
+                capabilities,
+                self.unsupported_method_policy,
+                request,
+            )
+            .await?
+        } else {
+            ReqmodOutcome::Request(request)
+        };
+        let (request_head, reqmod, reqmod_capabilities, response) = match request {
+            ReqmodOutcome::Request(request) => {
+                let request_head = self
+                    .response_service
+                    .as_ref()
+                    .map(|_| HttpRequest::from_parts(request.clone_parts(), ()));
+                let reqmod = request.extensions().get_ref::<ReqmodResult>().cloned();
+                let capabilities = request.extensions().get_arc::<ServiceCapabilities>();
+                let response = self
+                    .inner
+                    .serve(request)
+                    .await
+                    .context("serve ICAP-adapted HTTP request")?
+                    .map(Body::new);
+                (request_head, reqmod, capabilities, response)
+            }
+            ReqmodOutcome::Response(response) => return Ok(response),
+        };
+        let response = if let Some(service) = &self.response_service {
+            let capabilities = discover(self.options.as_ref(), service).await?;
+            adapt_response(
+                &self.client,
+                self.options_cache.as_ref(),
+                service,
+                capabilities,
+                self.unsupported_method_policy,
+                request_head
+                    .as_ref()
+                    .context("RESPMOD request metadata disappeared")?,
+                response,
+            )
+            .await?
+        } else {
+            response
+        };
+        if response
+            .extensions()
+            .get_ref::<ServiceCapabilities>()
+            .is_none()
+            && let Some(capabilities) = reqmod_capabilities
+        {
+            response.extensions().insert_arc(capabilities);
+        }
+        if let Some(reqmod) = reqmod {
+            response.extensions().insert(reqmod);
+        }
+        Ok(response)
+    }
+}
+
+async fn discover<D>(
+    options: Option<&D>,
+    service: &ServiceEndpoint,
+) -> Result<Option<Arc<ServiceCapabilities>>, BoxError>
+where
+    D: Service<OptionsRequest>,
+    D::Output: Into<Arc<ServiceCapabilities>>,
+    D::Error: Into<BoxError>,
+{
+    let Some(options) = options else {
+        return Ok(None);
+    };
+    options
+        .serve(service.options_request()?)
+        .await
+        .map(|capabilities| Some(capabilities.into()))
+        .context("discover ICAP service capabilities")
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(super) struct EffectivePolicy {
+    pub(super) adapt: bool,
+    pub(super) preview: Option<crate::proto::Preview>,
+    pub(super) allow_204: bool,
+    pub(super) allow_206: bool,
+    pub(super) allow_icap_trailers: bool,
+}
+
+pub(super) fn effective_policy(
+    service: &ServiceEndpoint,
+    capabilities: Option<&ServiceCapabilities>,
+    method: crate::proto::MethodKind,
+    extension: &str,
+    unsupported_method_policy: UnsupportedMethodPolicy,
+) -> Result<EffectivePolicy, BoxError> {
+    let Some(capabilities) = capabilities else {
+        return Ok(EffectivePolicy {
+            adapt: true,
+            preview: service.preview(),
+            allow_204: service.allows_204(),
+            allow_206: service.allows_206(),
+            allow_icap_trailers: service.allows_icap_trailers(),
+        });
+    };
+    match capabilities.methods().support(method) {
+        MethodSupport::Supported => {}
+        MethodSupport::Unsupported => {
+            return match unsupported_method_policy {
+                UnsupportedMethodPolicy::Error => Err(BoxError::from_static_str(
+                    "ICAP service does not advertise the adaptation method",
+                )),
+                UnsupportedMethodPolicy::Bypass => Ok(EffectivePolicy {
+                    adapt: false,
+                    preview: None,
+                    allow_204: false,
+                    allow_206: false,
+                    allow_icap_trailers: false,
+                }),
+            };
+        }
+        MethodSupport::Unknown => {
+            return Err(BoxError::from_static_str(
+                "ICAP service returned no usable Methods capability",
+            ));
+        }
+    }
+    let disposition = capabilities.transfer_rules().classify(extension);
+    Ok(EffectivePolicy {
+        adapt: disposition != TransferDisposition::Ignore,
+        preview: (disposition == TransferDisposition::Preview)
+            .then(|| {
+                service
+                    .preview()
+                    .zip(capabilities.preview())
+                    .map(|(local, peer)| local.min(peer))
+            })
+            .flatten(),
+        allow_204: service.allows_204() && capabilities.allows_204(),
+        allow_206: service.allows_206() && capabilities.allows_206(),
+        allow_icap_trailers: service.allows_icap_trailers() && capabilities.allows_icap_trailers(),
+    })
+}
+
+enum ReqmodOutcome {
+    Request(HttpRequest<Body>),
+    Response(HttpResponse<Body>),
+}
+
+async fn adapt_request<C, IO>(
+    client: &C,
+    options_cache: Option<&OptionsCacheHandle>,
+    service: &ServiceEndpoint,
+    capabilities: Option<Arc<ServiceCapabilities>>,
+    unsupported_method_policy: UnsupportedMethodPolicy,
+    mut request: HttpRequest<Body>,
+) -> Result<ReqmodOutcome, BoxError>
+where
+    C: ConnectorService<ConnectRequest, Connection = ClientConnection<IO>>,
+    IO: Io + Unpin + ExtensionsRef,
+{
+    let policy = effective_policy(
+        service,
+        capabilities.as_deref(),
+        crate::proto::MethodKind::Reqmod,
+        request_target_extension(request.uri())
+            .as_deref()
+            .unwrap_or(""),
+        unsupported_method_policy,
+    )?;
+    if let Some(capabilities) = capabilities.as_ref() {
+        request.extensions().insert_arc(Arc::clone(capabilities));
+    }
+    if !policy.adapt {
+        return Ok(ReqmodOutcome::Request(request));
+    }
+    let version = request.version();
+    let original_head = SanitizedHttpHead::take(request.headers_mut(), version);
+    normalize_request_authority(&mut request)?;
+    let preview = (!request.body().is_end_stream())
+        .then_some(policy.preview)
+        .flatten()
+        .map(|preview| replay_bounded_preview(preview, service));
+    let replayable = if policy.allow_204 || policy.allow_206 {
+        let (body, replayable) =
+            prepare_replay_body(core::mem::take(request.body_mut()), service.replay_limits())
+                .await?;
+        *request.body_mut() = body;
+        replayable
+    } else {
+        false
+    };
+    let allow_204 = policy.allow_204 && replayable;
+    let allow_206 = policy.allow_206 && replayable && (preview.is_some() || allow_204);
+    let headers = service.adaptation_headers(
+        original_head.forwarded_icap_headers(),
+        allow_204,
+        allow_206,
+        policy.allow_icap_trailers,
+    )?;
+    let request = ClientRequest::reqmod_for_uri(service.uri(), &headers, request, preview)
+        .context("build ICAP REQMOD request")?
+        .with_additional_trailer_forbidden(original_head.nominated_headers())
+        .with_replay_limits(service.replay_limits());
+    let connect = service.connect_request();
+    let EstablishedClientConnection { conn, .. } = client
+        .connect(connect)
+        .await
+        .context("connect to ICAP REQMOD service")?;
+    let response = conn
+        .send_http_owned(request)
+        .await
+        .context("execute ICAP REQMOD transaction")?;
+    invalidate_changed_istag(
+        options_cache,
+        service,
+        capabilities.as_deref(),
+        response.icap(),
+    )
+    .await;
+    validate_success_status(Method::Reqmod, response.icap().status())?;
+    let result = ReqmodResult(response.icap().clone());
+    if response.request().is_some() {
+        let mut request = response
+            .into_request()
+            .context("decode ICAP REQMOD request result")?;
+        let version = request.version();
+        let effective_head = sanitize_adapted_http_headers(request.headers_mut(), version);
+        original_head.restore_request(
+            request.headers_mut(),
+            version,
+            effective_head.nominated_headers(),
+        );
+        normalize_request_authority(&mut request)?;
+        restore_proxy_header(
+            request.headers_mut(),
+            &http_header::PROXY_AUTHORIZATION,
+            header::PROXY_AUTHORIZATION,
+            original_head.forwarded_icap_headers(),
+            effective_head.forwarded_icap_headers(),
+        );
+        request.extensions().insert(result);
+        Ok(ReqmodOutcome::Request(request))
+    } else if response.response().is_some() {
+        let mut response = response
+            .into_response()
+            .context("decode ICAP REQMOD response result")?;
+        let version = response.version();
+        let effective_head = sanitize_adapted_http_headers(response.headers_mut(), version);
+        restore_proxy_header(
+            response.headers_mut(),
+            &http_header::PROXY_AUTHENTICATE,
+            header::PROXY_AUTHENTICATE,
+            &[],
+            effective_head.forwarded_icap_headers(),
+        );
+        response.extensions().insert(result);
+        Ok(ReqmodOutcome::Response(response))
+    } else {
+        Err(BoxError::from_static_str(
+            "ICAP REQMOD result has no HTTP request or response",
+        ))
+    }
+}
+
+async fn adapt_response<C, IO>(
+    client: &C,
+    options_cache: Option<&OptionsCacheHandle>,
+    service: &ServiceEndpoint,
+    capabilities: Option<Arc<ServiceCapabilities>>,
+    unsupported_method_policy: UnsupportedMethodPolicy,
+    request: &HttpRequest<()>,
+    mut response: HttpResponse<Body>,
+) -> Result<HttpResponse<Body>, BoxError>
+where
+    C: ConnectorService<ConnectRequest, Connection = ClientConnection<IO>>,
+    IO: Io + Unpin + ExtensionsRef,
+{
+    let policy = effective_policy(
+        service,
+        capabilities.as_deref(),
+        crate::proto::MethodKind::Respmod,
+        request_target_extension(request.uri())
+            .as_deref()
+            .unwrap_or(""),
+        unsupported_method_policy,
+    )?;
+    if let Some(capabilities) = capabilities.as_ref() {
+        response.extensions().insert_arc(Arc::clone(capabilities));
+    }
+    if !policy.adapt {
+        return Ok(response);
+    }
+    let mut request = HttpRequest::from_parts(request.clone_parts(), ());
+    let request_version = request.version();
+    let request_head = SanitizedHttpHead::take(request.headers_mut(), request_version);
+    normalize_request_authority(&mut request)?;
+    let response_version = response.version();
+    let original_response_head = SanitizedHttpHead::take(response.headers_mut(), response_version);
+    let mut forwarded = request_head.forwarded_icap_headers().to_vec();
+    forwarded.extend_from_slice(original_response_head.forwarded_icap_headers());
+    let preview = (!response.body().is_end_stream())
+        .then_some(policy.preview)
+        .flatten()
+        .map(|preview| replay_bounded_preview(preview, service));
+    let replayable = if policy.allow_204 || policy.allow_206 {
+        let (body, replayable) = prepare_replay_body(
+            core::mem::take(response.body_mut()),
+            service.replay_limits(),
+        )
+        .await?;
+        *response.body_mut() = body;
+        replayable
+    } else {
+        false
+    };
+    let allow_204 = policy.allow_204 && replayable;
+    let allow_206 = policy.allow_206 && replayable && (preview.is_some() || allow_204);
+    let headers =
+        service.adaptation_headers(&forwarded, allow_204, allow_206, policy.allow_icap_trailers)?;
+    let request =
+        ClientRequest::respmod_for_uri(service.uri(), &headers, &request, response, preview)
+            .context("build ICAP RESPMOD request")?
+            .with_additional_trailer_forbidden(original_response_head.nominated_headers())
+            .with_replay_limits(service.replay_limits());
+    let connect = service.connect_request();
+    let EstablishedClientConnection { conn, .. } = client
+        .connect(connect)
+        .await
+        .context("connect to ICAP RESPMOD service")?;
+    let response = conn
+        .send_http_owned(request)
+        .await
+        .context("execute ICAP RESPMOD transaction")?;
+    invalidate_changed_istag(
+        options_cache,
+        service,
+        capabilities.as_deref(),
+        response.icap(),
+    )
+    .await;
+    validate_success_status(Method::Respmod, response.icap().status())?;
+    let result = RespmodResult(response.icap().clone());
+    let mut response = response
+        .into_response()
+        .context("decode ICAP RESPMOD result")?;
+    let version = response.version();
+    let effective_head = sanitize_adapted_http_headers(response.headers_mut(), version);
+    original_response_head.restore_response(
+        response.headers_mut(),
+        version,
+        effective_head.nominated_headers(),
+    );
+    restore_proxy_header(
+        response.headers_mut(),
+        &http_header::PROXY_AUTHENTICATE,
+        header::PROXY_AUTHENTICATE,
+        original_response_head.forwarded_icap_headers(),
+        effective_head.forwarded_icap_headers(),
+    );
+    response.extensions().insert(result);
+    Ok(response)
+}
+
+pub(super) async fn prepare_replay_body(
+    mut body: Body,
+    limits: ReplayLimits,
+) -> Result<(Body, bool), BoxError> {
+    let Some(length) = body.size_hint().exact() else {
+        return Ok((body, false));
+    };
+    if length > u64::try_from(limits.max_bytes()).unwrap_or(u64::MAX) {
+        return Ok((body, false));
+    }
+
+    let mut prefix = VecDeque::new();
+    let mut bytes = 0_usize;
+    let mut frames = 0_usize;
+    loop {
+        let frame = poll_fn(|context| Pin::new(&mut body).poll_frame(context))
+            .await
+            .transpose()?;
+        let Some(frame) = frame else {
+            return Ok((body_from_prefix(prefix, body), true));
+        };
+        let frame_bytes = if let Some(data) = frame.data_ref() {
+            data.len()
+        } else if let Some(trailers) = frame.trailers_ref() {
+            trailers
+                .iter()
+                .try_fold(2_usize, |length, (name, value)| {
+                    length
+                        .checked_add(name.as_str().len())
+                        .and_then(|length| length.checked_add(value.as_bytes().len()))
+                        .and_then(|length| length.checked_add(4))
+                })
+                .unwrap_or(usize::MAX)
+        } else {
+            prefix.push_back(frame);
+            return Ok((body_from_prefix(prefix, body), false));
+        };
+        if frame_bytes != 0 {
+            bytes = bytes.saturating_add(frame_bytes);
+            frames = frames.saturating_add(1);
+        }
+        prefix.push_back(frame);
+        if bytes > limits.max_bytes() || frames > limits.max_frames() {
+            return Ok((body_from_prefix(prefix, body), false));
+        }
+    }
+}
+
+fn body_from_prefix(prefix: VecDeque<Frame<Bytes>>, body: Body) -> Body {
+    if prefix.is_empty() {
+        return body;
+    }
+    let prefix = stream::iter(prefix.into_iter().map(Ok::<_, BoxError>));
+    Body::from_frame_stream(prefix.chain(BodyStream::new(body)))
+}
+
+pub(super) fn replay_bounded_preview(
+    preview: crate::proto::Preview,
+    service: &ServiceEndpoint,
+) -> crate::proto::Preview {
+    let limits = service.replay_limits();
+    let guaranteed_frames = u64::try_from(limits.max_frames()).unwrap_or(u64::MAX);
+    let bytes = u64::try_from(limits.max_bytes()).unwrap_or(u64::MAX);
+    preview.min(crate::proto::Preview::new(bytes.min(guaranteed_frames)))
+}
+
+async fn invalidate_changed_istag(
+    options_cache: Option<&OptionsCacheHandle>,
+    service: &ServiceEndpoint,
+    capabilities: Option<&ServiceCapabilities>,
+    response: &IcapResponse,
+) {
+    let (Some(options_cache), Some(expected), Some(observed)) = (
+        options_cache,
+        capabilities.and_then(ServiceCapabilities::service_tag),
+        response.service_tag(),
+    ) else {
+        return;
+    };
+    if expected != observed {
+        options_cache.invalidate(service.uri()).await;
+    }
+}
+
+pub(super) fn request_target_extension(uri: &rama_net::uri::Uri) -> Option<Cow<'_, str>> {
+    let segment = uri.last_path_segment()?.as_decoded_str();
+    let separator = segment.rfind('.')?;
+    Some(match segment {
+        Cow::Borrowed(segment) => Cow::Borrowed(&segment[separator + 1..]),
+        Cow::Owned(mut segment) => Cow::Owned(segment.split_off(separator + 1)),
+    })
+}
+
+pub(super) fn validate_success_status(
+    method: Method<'static>,
+    status: crate::proto::StatusCode,
+) -> Result<(), BoxError> {
+    let success = match method {
+        Method::Reqmod | Method::Respmod => matches!(
+            status,
+            crate::proto::StatusCode::OK
+                | crate::proto::StatusCode::CREATED
+                | crate::proto::StatusCode::NO_MODIFICATION_NEEDED
+                | crate::proto::StatusCode::PARTIAL_CONTENT
+        ),
+        _ => false,
+    };
+    if success {
+        Ok(())
+    } else {
+        Err(BoxError::from_static_str("ICAP adaptation failed")
+            .context_field("method", method.as_str())
+            .context_field("status", status.as_u16()))
+    }
+}

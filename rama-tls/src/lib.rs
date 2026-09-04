@@ -1,8 +1,9 @@
 //! rama TLS-agnostic types and utilities.
 //!
 //! The TLS-implementation-agnostic vocabulary (protocol versions, cipher suites,
-//! ALPN, client/server config, `ClientHello`, fingerprints, keylog, …) shared by
+//! client/server config, `ClientHello`, fingerprints, keylog, …) shared by
 //! the backend crates (`rama-tls-boring` / `rama-tls-rustls`).
+//! Protocol-neutral ALPN identifiers and offers live in [`rama_net::tls`].
 //!
 //! Learn more about `rama`:
 //!
@@ -21,12 +22,12 @@
 use std::borrow::Cow;
 
 use rama_core::extensions::Extension;
-use rama_utils::collections::smallvec::{SmallVec, smallvec};
+use rama_net::Protocol;
 
 mod enums;
 pub use enums::{
-    ApplicationProtocol, CertificateCompressionAlgorithm, CipherSuite, CompressionAlgorithm,
-    ECPointFormat, ExtensionId, ProtocolVersion, SignatureScheme, SupportedGroup,
+    CertificateCompressionAlgorithm, CipherSuite, CompressionAlgorithm, ECPointFormat, ExtensionId,
+    ProtocolVersion, SignatureScheme, SupportedGroup,
 };
 
 pub mod client;
@@ -34,39 +35,8 @@ pub mod fingerprint;
 pub mod keylog;
 pub mod server;
 
-#[cfg(feature = "http")]
-mod http;
-
 #[cfg(feature = "dial9")]
 mod dial9;
-
-/// ALPN protocols to offer.
-#[derive(Clone, Debug, Extension)]
-#[extension(tags(tls))]
-pub struct TlsAlpn(pub SmallVec<[ApplicationProtocol; 2]>);
-
-impl TlsAlpn {
-    /// Offer HTTP/2 and HTTP/1.1.
-    #[must_use]
-    pub fn http_auto() -> Self {
-        Self(smallvec![
-            ApplicationProtocol::HTTP_2,
-            ApplicationProtocol::HTTP_11,
-        ])
-    }
-
-    /// Offer HTTP/1.1 only.
-    #[must_use]
-    pub fn http_1() -> Self {
-        Self(smallvec![ApplicationProtocol::HTTP_11])
-    }
-
-    /// Offer HTTP/2 only.
-    #[must_use]
-    pub fn http_2() -> Self {
-        Self(smallvec![ApplicationProtocol::HTTP_2])
-    }
-}
 
 /// Keylog intent (e.g. `SSLKEYLOGFILE`) for the connection.
 #[derive(Debug, Clone, Extension)]
@@ -81,11 +51,93 @@ pub struct TlsSupportedVersions(pub Vec<ProtocolVersion>);
 
 #[derive(Debug, Clone, Extension)]
 #[extension(tags(tls))]
-/// Context information that can be provided by `tls` connectors,
-/// to configure the connection in function on an tls tunnel.
+/// Requests TLS from a tunnel connector with proxy-scoped identity and ALPN.
+///
+/// Tunnel connectors combine these explicit fields with only their dedicated
+/// base configuration. Final-destination TLS request extensions are isolated
+/// from the tunnel-side handshake.
 pub struct TlsTunnel {
-    /// The server name to use for the connection.
-    pub sni: Option<rama_net::address::Host>,
+    /// Server identity used for certificate verification and, for DNS names, SNI.
+    pub server_identity: Option<rama_net::address::Host>,
+    /// Application protocol spoken inside the TLS tunnel.
+    ///
+    /// This is distinct from the final destination protocol. For example, an
+    /// ICAPS connection through a TLS-protected HTTP proxy speaks HTTP to the
+    /// proxy before the CONNECT tunnel carries ICAP.
+    pub application_protocol: Option<Protocol>,
+    /// ALPN protocols to offer for this tunnel-side TLS handshake.
+    ///
+    /// This is distinct from the final destination's ALPN offer. `None` uses
+    /// the tunnel connector's base policy or the tunnel protocol's default;
+    /// `Some(TlsAlpn::empty())` explicitly omits ALPN.
+    pub alpn: Option<rama_net::tls::TlsAlpn>,
+}
+
+/// Whether a tunnel connector should use plaintext or TLS.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TlsTunnelMode<'a> {
+    /// No tunnel context or fallback identity requested TLS.
+    Plain,
+    /// TLS was requested, with an optional server certificate identity.
+    Tls(Option<&'a rama_net::address::Host>),
+}
+
+/// Resolve tunnel activation and server identity consistently across TLS backends.
+#[must_use]
+pub fn resolve_tls_tunnel<'a>(
+    tunnel: Option<&'a TlsTunnel>,
+    fallback_server_identity: Option<&'a rama_net::address::Host>,
+) -> TlsTunnelMode<'a> {
+    match tunnel {
+        Some(tunnel) => {
+            TlsTunnelMode::Tls(tunnel.server_identity.as_ref().or(fallback_server_identity))
+        }
+        None => fallback_server_identity.map_or(TlsTunnelMode::Plain, |identity| {
+            TlsTunnelMode::Tls(Some(identity))
+        }),
+    }
+}
+
+#[cfg(test)]
+mod tunnel_tests {
+    use super::*;
+    use rama_net::address::Host;
+
+    #[test]
+    fn hardcoded_identity_enables_tls_without_context() {
+        let identity = Host::from_static("example.com");
+        assert_eq!(
+            resolve_tls_tunnel(None, Some(&identity)),
+            TlsTunnelMode::Tls(Some(&identity))
+        );
+    }
+
+    #[test]
+    fn empty_context_falls_back_to_hardcoded_identity() {
+        let tunnel = TlsTunnel {
+            server_identity: None,
+            application_protocol: None,
+            alpn: None,
+        };
+        let identity = Host::from_static("example.com");
+        assert_eq!(
+            resolve_tls_tunnel(Some(&tunnel), Some(&identity)),
+            TlsTunnelMode::Tls(Some(&identity))
+        );
+    }
+
+    #[test]
+    fn empty_context_without_fallback_still_requests_tls() {
+        let tunnel = TlsTunnel {
+            server_identity: None,
+            application_protocol: None,
+            alpn: None,
+        };
+        assert_eq!(
+            resolve_tls_tunnel(Some(&tunnel), None),
+            TlsTunnelMode::Tls(None)
+        );
+    }
 }
 
 #[derive(Debug, Clone, Default, Extension)]

@@ -109,11 +109,20 @@ pub struct InvalidHeaderName {
     _priv: (),
 }
 
+macro_rules! standard_header_trailer_allowed {
+    () => {
+        false
+    };
+    (trailer) => {
+        true
+    };
+}
+
 macro_rules! standard_headers {
     (
         $(
             $(#[$docs:meta])*
-            ($konst:ident, $upcase:ident, $name_bytes:literal);
+            ($konst:ident, $upcase:ident, $name_bytes:literal $(, $trailer:ident)?);
         )+
     ) => {
         #[derive(Debug, Clone, Copy, Eq, PartialEq, Hash)]
@@ -134,6 +143,14 @@ macro_rules! standard_headers {
         )+
 
         impl StandardHeader {
+            const fn is_allowed_in_trailers(self) -> bool {
+                match self {
+                    $(
+                    StandardHeader::$konst => standard_header_trailer_allowed!($($trailer)?),
+                    )+
+                }
+            }
+
             const fn as_bytes(&self) -> &'static [u8] {
                 match *self {
                     $(
@@ -305,7 +322,7 @@ standard_headers! {
     ///
     /// In presence of an Accept-Ranges header, the browser may try to resume an
     /// interrupted download, rather than to start it from the start again.
-    (AcceptRanges, ACCEPT_RANGES, b"accept-ranges");
+    (AcceptRanges, ACCEPT_RANGES, b"accept-ranges", trailer);
 
     /// Preflight response indicating if the response to the request can be
     /// exposed to the page.
@@ -393,6 +410,16 @@ standard_headers! {
 
     /// Advertises the availability of alternate services to clients.
     (AltSvc, ALT_SVC, b"alt-svc");
+
+    /// Communicates information after a client's authentication credentials
+    /// have been accepted.
+    ///
+    /// Its semantics are defined by the authentication scheme named by the
+    /// corresponding request's `Authorization` header. A proxy forwarding the
+    /// response must not modify this field.
+    ///
+    /// See [RFC 7615, section 3](https://www.rfc-editor.org/rfc/rfc7615.html#section-3).
+    (AuthenticationInfo, AUTHENTICATION_INFO, b"authentication-info");
 
     /// Contains the credentials to authenticate a user agent with a server.
     ///
@@ -562,7 +589,7 @@ standard_headers! {
     /// to quickly determine whether two representations of a resource are the
     /// same, but they might also be set to persist indefinitely by a tracking
     /// server.
-    (Etag, ETAG, b"etag");
+    (Etag, ETAG, b"etag", trailer);
 
     /// Indicates expectations that need to be fulfilled by the server in order
     /// to properly handle the request.
@@ -817,6 +844,16 @@ standard_headers! {
     /// The `proxy-authenticate` header is sent along with a `407 Proxy
     /// Authentication Required`.
     (ProxyAuthenticate, PROXY_AUTHENTICATE, b"proxy-authenticate");
+
+    /// Communicates information after proxy authentication credentials have
+    /// been accepted.
+    ///
+    /// Its semantics are defined by the authentication scheme named by the
+    /// corresponding request's `Proxy-Authorization` header. This field applies
+    /// only to the next outbound client on the response chain.
+    ///
+    /// See [RFC 7615, section 4](https://www.rfc-editor.org/rfc/rfc7615.html#section-4).
+    (ProxyAuthenticationInfo, PROXY_AUTHENTICATION_INFO, b"proxy-authentication-info");
 
     /// Contains the credentials to authenticate a user agent to a proxy server.
     ///
@@ -1541,10 +1578,45 @@ impl HeaderName {
     /// Returns the standard header represented by this name, if this is a
     /// standard header.
     #[inline]
-    pub fn standard(&self) -> Option<StandardHeader> {
+    pub const fn standard(&self) -> Option<StandardHeader> {
         match self.inner {
             Repr::Standard(v) => Some(v.header),
             Repr::Custom(_) => None,
+        }
+    }
+
+    /// Returns whether values for this header are sensitive by default.
+    ///
+    /// This covers standard credential and cookie headers. Custom header
+    /// sensitivity remains application policy and must be marked explicitly
+    /// on the corresponding [`HeaderValue`](super::HeaderValue).
+    #[must_use]
+    #[inline]
+    pub const fn is_sensitive(&self) -> bool {
+        matches!(
+            self.standard(),
+            Some(
+                StandardHeader::Authorization
+                    | StandardHeader::ProxyAuthorization
+                    | StandardHeader::Cookie
+                    | StandardHeader::SetCookie
+            )
+        )
+    }
+
+    /// Returns whether the built-in field policy permits this name in an HTTP
+    /// trailer block.
+    ///
+    /// Standard fields are rejected unless their definitions explicitly allow
+    /// trailer use. Extension fields are accepted here, but their definitions
+    /// still have to permit trailer use. A field named by a `Connection` value
+    /// is also disallowed; that message-local rule is checked separately.
+    #[must_use]
+    #[inline]
+    pub const fn is_allowed_in_trailers(&self) -> bool {
+        match self.standard() {
+            Some(header) => header.is_allowed_in_trailers(),
+            None => true,
         }
     }
 
@@ -1636,7 +1708,7 @@ impl serde::Serialize for HeaderName {
     where
         S: serde::Serializer,
     {
-        serializer.serialize_str(&self.to_string())
+        serializer.collect_str(self)
     }
 }
 
@@ -2286,6 +2358,33 @@ mod tests {
         let name = HeaderName::from_static("Vary");
         assert_eq!(name.standard(), Some(Vary));
         assert_eq!(name.to_string(), "Vary");
+    }
+
+    #[test]
+    fn test_sensitive_header_names() {
+        for name in [
+            HeaderName::from_static("Authorization"),
+            HeaderName::from_static("Proxy-Authorization"),
+            HeaderName::from_static("Cookie"),
+            HeaderName::from_static("Set-Cookie"),
+        ] {
+            assert!(name.is_sensitive());
+        }
+        assert!(!HeaderName::from_static("Proxy-Authenticate").is_sensitive());
+        assert!(!HeaderName::from_static("X-Api-Key").is_sensitive());
+    }
+
+    #[test]
+    fn test_http_trailer_field_policy() {
+        for &(standard, _) in TEST_HEADERS {
+            let name = HeaderName::from(standard);
+            assert_eq!(
+                name.is_allowed_in_trailers(),
+                standard.is_allowed_in_trailers(),
+                "{name}",
+            );
+        }
+        assert!(HeaderName::from_static("X-Checksum").is_allowed_in_trailers());
     }
 
     #[test]

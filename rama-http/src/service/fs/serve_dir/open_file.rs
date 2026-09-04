@@ -5,7 +5,6 @@ use super::{
 use crate::headers::{ETag, HeaderMapExt as _, IfMatch, IfNoneMatch};
 use crate::headers::{encoding::Encoding, specifier::QualityValue};
 use crate::{HeaderValue, Method, Request, header};
-use http_range_header::RangeUnsatisfiableError;
 use rama_core::combinators::Either;
 use rama_core::telemetry::tracing;
 use rama_http_types::mime::Mime;
@@ -46,6 +45,11 @@ pub(super) enum OpenFileOutput {
     InvalidFilename,
 }
 
+pub(super) enum RangeError {
+    Unsatisfiable,
+    MultipleRangesNotSupported,
+}
+
 impl OpenFileOutput {
     /// Create a new FileOpened variant with the given parameters.
     #[expect(
@@ -57,7 +61,7 @@ impl OpenFileOutput {
         chunk_size: usize,
         mime: Mime,
         maybe_encoding: Option<Encoding>,
-        maybe_range: Option<Result<Vec<RangeInclusive<u64>>, RangeUnsatisfiableError>>,
+        maybe_range: Option<Result<RangeInclusive<u64>, RangeError>>,
         last_modified: Option<LastModified>,
         precompression_configured: bool,
         etag: Option<ETag>,
@@ -81,7 +85,7 @@ pub(super) struct FileOpened {
     pub(super) chunk_size: usize,
     pub(super) mime_value: Mime,
     pub(super) maybe_encoding: Option<Encoding>,
-    pub(super) maybe_range: Option<Result<Vec<RangeInclusive<u64>>, RangeUnsatisfiableError>>,
+    pub(super) maybe_range: Option<Result<RangeInclusive<u64>, RangeError>>,
     pub(super) last_modified: Option<LastModified>,
     /// Whether `ServeDir` was configured with any precompressed variants.
     /// When true, the response advertises `Vary: Accept-Encoding` even if
@@ -131,6 +135,7 @@ pub(super) async fn open_file(
     req: Request,
     negotiated_encodings: Vec<QualityValue<Encoding>>,
     range_header: Option<&str>,
+    ignore_multi_range_requests: bool,
     buf_chunk_size: usize,
     source: &DirSource,
     precompression_configured: bool,
@@ -139,6 +144,7 @@ pub(super) async fn open_file(
     let mime = match variant {
         ServeVariant::Directory {
             serve_mode,
+            redirect_to_trailing_slash,
             html_as_default_extension,
         } => {
             // Might already at this point know a redirect or not found result should be
@@ -148,6 +154,7 @@ pub(super) async fn open_file(
                 &mut path_to_file,
                 req.uri(),
                 serve_mode,
+                redirect_to_trailing_slash,
                 html_as_default_extension,
                 source,
                 symlink_policy,
@@ -185,7 +192,8 @@ pub(super) async fn open_file(
                     return Ok(output);
                 }
 
-                let maybe_range = try_parse_range(range_header, meta.len());
+                let maybe_range =
+                    try_parse_range(range_header, meta.len(), ignore_multi_range_requests);
 
                 Ok(OpenFileOutput::new_file_opened(
                     FileRequestExtent::Head(meta),
@@ -205,6 +213,9 @@ pub(super) async fn open_file(
                     negotiated_encodings,
                 ) {
                     Ok(result) => result,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        return Ok(OpenFileOutput::FileNotFound);
+                    }
                     Err(err) => return Err(err),
                 };
 
@@ -218,7 +229,8 @@ pub(super) async fn open_file(
                     return Ok(output);
                 }
 
-                let maybe_range = try_parse_range(range_header, content_length);
+                let maybe_range =
+                    try_parse_range(range_header, content_length, ignore_multi_range_requests);
 
                 Ok(OpenFileOutput::new_file_opened(
                     FileRequestExtent::EmbeddedHead(content_length),
@@ -259,11 +271,10 @@ pub(super) async fn open_file(
                     return Ok(output);
                 }
 
-                let maybe_range = try_parse_range(range_header, meta.len());
-                if let Some(Ok(ranges)) = maybe_range.as_ref()
-                    && ranges.len() == 1
-                {
-                    file.seek(SeekFrom::Start(*ranges[0].start())).await?;
+                let maybe_range =
+                    try_parse_range(range_header, meta.len(), ignore_multi_range_requests);
+                if let Some(Ok(range)) = maybe_range.as_ref() {
+                    file.seek(SeekFrom::Start(*range.start())).await?;
                 }
 
                 Ok(OpenFileOutput::new_file_opened(
@@ -284,6 +295,9 @@ pub(super) async fn open_file(
                     negotiated_encodings,
                 ) {
                     Ok(result) => result,
+                    Err(err) if err.kind() == io::ErrorKind::NotFound => {
+                        return Ok(OpenFileOutput::FileNotFound);
+                    }
                     Err(err) => return Err(err),
                 };
 
@@ -298,13 +312,12 @@ pub(super) async fn open_file(
                     return Ok(output);
                 }
 
-                let maybe_range = try_parse_range(range_header, content_length);
+                let maybe_range =
+                    try_parse_range(range_header, content_length, ignore_multi_range_requests);
 
                 let mut content = contents;
-                if let Some(Ok(ranges)) = maybe_range.as_ref()
-                    && ranges.len() == 1
-                {
-                    let start = *ranges[0].start() as usize;
+                if let Some(Ok(range)) = maybe_range.as_ref() {
+                    let start = *range.start() as usize;
                     content.drain(0..start.min(content.len()));
                 }
 
@@ -658,6 +671,7 @@ async fn maybe_serve_directory(
     path_to_file: &mut PathBuf,
     uri: &Uri,
     mode: DirectoryServeMode,
+    redirect_to_trailing_slash: bool,
     html_as_default_extension: bool,
     source: &DirSource,
     symlink_policy: ServeDirSymlinkPolicy,
@@ -666,7 +680,7 @@ async fn maybe_serve_directory(
 
     // `Some(true)` => directory, `Some(false)` => file, `None` => does not exist.
     let is_directory: Option<bool> = match source {
-        DirSource::Filesystem(_) => is_dir(source, path_to_file, symlink_policy).await,
+        DirSource::Filesystem(_) => is_dir(source, path_to_file, symlink_policy).await?,
         DirSource::Embedded(base) => is_dir_embedded(path_to_file, base).await,
     };
 
@@ -691,7 +705,7 @@ async fn maybe_serve_directory(
 
     match mode {
         DirectoryServeMode::AppendIndexHtml => {
-            if uri_path.ends_with('/') {
+            if uri_path.ends_with('/') || !redirect_to_trailing_slash {
                 path_to_file.push("index.html");
                 Ok(None)
             } else {
@@ -719,11 +733,29 @@ async fn maybe_serve_directory(
 fn try_parse_range(
     maybe_range_ref: Option<&str>,
     file_size: u64,
-) -> Option<Result<Vec<RangeInclusive<u64>>, RangeUnsatisfiableError>> {
-    maybe_range_ref.map(|header_value| {
-        http_range_header::parse_range_header(header_value)
-            .and_then(|first_pass| first_pass.validate(file_size))
-    })
+    ignore_multi_range_requests: bool,
+) -> Option<Result<RangeInclusive<u64>, RangeError>> {
+    let header_value = maybe_range_ref?;
+    let Ok(parsed) = http_range_header::parse_range_header(header_value) else {
+        return Some(Err(RangeError::Unsatisfiable));
+    };
+
+    if parsed.ranges.len() > 1 {
+        // ServeDir and ServeFile do not support multipart responses. Optionally
+        // ignore the Range header before semantic and overlap validation.
+        return if ignore_multi_range_requests {
+            None
+        } else {
+            Some(Err(RangeError::MultipleRangesNotSupported))
+        };
+    }
+
+    Some(
+        parsed
+            .validate(file_size)
+            .map_err(|_err| RangeError::Unsatisfiable)
+            .and_then(|mut ranges| ranges.pop().ok_or(RangeError::Unsatisfiable)),
+    )
 }
 
 /// `Some(true)` => exists and is a directory. `Some(false)` => exists and is
@@ -734,11 +766,14 @@ async fn is_dir(
     source: &DirSource,
     path_to_file: &Path,
     symlink_policy: ServeDirSymlinkPolicy,
-) -> Option<bool> {
-    filesystem_metadata(source, path_to_file, symlink_policy)
-        .await
-        .ok()
-        .map(|meta_data| meta_data.is_dir())
+) -> io::Result<Option<bool>> {
+    match filesystem_metadata(source, path_to_file, symlink_policy).await {
+        Ok(metadata) => Ok(Some(metadata.is_dir())),
+        Err(err) if err.kind() == io::ErrorKind::NotFound || is_invalid_filename_error(&err) => {
+            Ok(None)
+        }
+        Err(err) => Err(err),
+    }
 }
 
 async fn is_dir_embedded(path_to_file: &Path, base: &Dir<'_>) -> Option<bool> {

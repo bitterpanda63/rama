@@ -19,6 +19,7 @@ use rama::{
     net::{
         Protocol,
         address::{ProxyAddress, SocketAddress},
+        client::ProxyRoute,
         user::{Basic, ProxyCredential},
     },
     rt::Executor,
@@ -67,14 +68,14 @@ async fn test_http_client_over_socks5_proxy_connect(
 
     let resp = runner
         .get(uri)
-        .extension(ProxyAddress {
+        .extension(ProxyRoute::Proxy(ProxyAddress {
             protocol: Some(Protocol::SOCKS5),
             address: proxy_socket_addr.into(),
             credential: Some(ProxyCredential::Basic(Basic::new(
                 non_empty_str!("john"),
                 non_empty_str!("secret"),
             ))),
-        })
+        }))
         .send()
         .await
         .expect("make http request via socks5 proxy")
@@ -88,7 +89,7 @@ async fn test_http_client_over_socks5_proxy_connect(
 
 async fn spawn_http_server() -> SocketAddress {
     let tcp_service =
-        TcpListener::bind_address(SocketAddress::default_ipv4(63020), Executor::default())
+        TcpListener::bind_address(SocketAddress::local_ipv4(63020), Executor::default())
             .await
             .expect("bind HTTP server on open port");
 

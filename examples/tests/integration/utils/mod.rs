@@ -1,13 +1,12 @@
 #![allow(dead_code)]
 
-#[cfg(feature = "http-full")]
-use rama::http::Body;
 use rama::telemetry::tracing::{
     self,
     level_filters::LevelFilter,
     subscriber::{self, EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt},
 };
 use std::{
+    ffi::OsString,
     process::{Child, ExitStatus, Output},
     sync::Once,
 };
@@ -19,12 +18,11 @@ use ::std::time::Duration;
 use rama::{
     Layer, Service,
     error::BoxError,
-    http::StreamingBody,
     http::client::proxy::layer::SetProxyAuthHttpHeaderLayer,
     http::service::client::{HttpClientExt, IntoUrl, RequestBuilder},
     http::ws::handshake::client::{HttpClientWebSocketExt, WebSocketRequestBuilder, WithService},
     http::{
-        Request, Response,
+        Body, Request, Response, StreamingBody,
         client::EasyHttpWebClient,
         layer::{
             follow_redirect::FollowRedirectLayer,
@@ -42,7 +40,13 @@ use rama::{
 use rama::http::layer::decompression::DecompressionLayer;
 
 #[cfg(all(feature = "http-full", feature = "boring"))]
-use rama::tls::client::{ServerVerifyMode, TlsClientConfig};
+use rama::{
+    crypto::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject as _},
+    tls::{
+        client::{ServerVerifyMode, TlsClientConfig},
+        server::{ServerAuthData, TlsServerConfig},
+    },
+};
 
 #[cfg(all(
     feature = "http-full",
@@ -113,7 +117,30 @@ impl ExampleRunner {
         example_name: impl AsRef<str>,
         extra_features: Option<&'static str>,
     ) -> Self {
-        Self::interactive_with_envs(example_name, extra_features, [])
+        Self::interactive_with_args_and_envs(
+            example_name,
+            extra_features,
+            std::iter::empty::<&str>(),
+            std::iter::empty::<(&str, &str)>(),
+        )
+    }
+
+    /// Run an example server with command-line arguments and create a client.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if the server process cannot be spawned.
+    pub(super) fn interactive_with_args(
+        example_name: impl AsRef<str>,
+        extra_features: Option<&'static str>,
+        args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+    ) -> Self {
+        Self::interactive_with_args_and_envs(
+            example_name,
+            extra_features,
+            args,
+            std::iter::empty::<(&str, &str)>(),
+        )
     }
 
     /// Run an example server and create a client for it for interactive testing.
@@ -126,7 +153,21 @@ impl ExampleRunner {
         extra_features: Option<&'static str>,
         envs: impl IntoIterator<Item = (&'static str, &'static str)>,
     ) -> Self {
-        let child = escargot::CargoBuild::new()
+        Self::interactive_with_args_and_envs(
+            example_name,
+            extra_features,
+            std::iter::empty::<&str>(),
+            envs,
+        )
+    }
+
+    fn interactive_with_args_and_envs(
+        example_name: impl AsRef<str>,
+        extra_features: Option<&'static str>,
+        args: impl IntoIterator<Item = impl AsRef<std::ffi::OsStr>>,
+        envs: impl IntoIterator<Item = (&'static str, &'static str)>,
+    ) -> Self {
+        let mut command = escargot::CargoBuild::new()
             .arg(format!(
                 "--features=cli,tcp,http-full,proxy-full,{}",
                 extra_features.unwrap_or_default()
@@ -136,7 +177,8 @@ impl ExampleRunner {
             .target_dir(examples_target_dir())
             .run()
             .unwrap()
-            .command()
+            .command();
+        let child = command
             .current_dir(workspace_root())
             .env(
                 "RUST_LOG",
@@ -144,6 +186,7 @@ impl ExampleRunner {
             )
             .env("SSLKEYLOGFILE", "./target/test_ssl_key_log.txt")
             .envs(envs)
+            .args(args)
             .spawn()
             .unwrap();
 
@@ -175,6 +218,7 @@ impl ExampleRunner {
                     .with_proxy_support()
                     .with_tls_support_using_boringssl(tls_config)
                     .with_default_http_connector(Executor::default())
+                    .without_connection_pool()
                     .build_client()
             };
 
@@ -195,6 +239,7 @@ impl ExampleRunner {
                     .with_proxy_support()
                     .with_tls_support_using_rustls(tls_config)
                     .with_default_http_connector(Executor::default())
+                    .without_connection_pool()
                     .build_client()
             };
 
@@ -316,11 +361,26 @@ impl ExampleRunner {
         example_name: impl AsRef<str>,
         args: impl IntoIterator<Item = impl AsRef<str>>,
     ) -> Output {
+        Self::run_with_args_and_envs_output(example_name, args, std::iter::empty()).await
+    }
+
+    /// Run an example with arguments and environment variables and capture its output.
+    ///
+    /// # Panics
+    ///
+    /// This function panics if the example process cannot be spawned
+    /// or if it fails while waiting for it to finish.
+    pub(super) async fn run_with_args_and_envs_output(
+        example_name: impl AsRef<str>,
+        args: impl IntoIterator<Item = impl AsRef<str>>,
+        envs: impl IntoIterator<Item = (String, OsString)>,
+    ) -> Output {
         let example_name = example_name.as_ref().to_owned();
         let args = args
             .into_iter()
             .map(|arg| arg.as_ref().to_owned())
             .collect::<Vec<_>>();
+        let envs = envs.into_iter().collect::<Vec<_>>();
         tokio::task::spawn_blocking(move || {
             let mut command = escargot::CargoBuild::new()
                 .arg("--all-features")
@@ -335,11 +395,42 @@ impl ExampleRunner {
                 "RUST_LOG",
                 std::env::var("RUST_LOG").unwrap_or("info".into()),
             );
-            command.args(args);
+            command.args(args).envs(envs);
             command.output().unwrap()
         })
         .await
         .unwrap()
+    }
+}
+
+/// TLS server configuration and certificate trusted by a child client.
+#[cfg(all(feature = "http-full", feature = "boring"))]
+pub(super) struct TestTlsConfig {
+    pub(super) server: TlsServerConfig,
+    certificate_file: std::path::PathBuf,
+}
+
+#[cfg(all(feature = "http-full", feature = "boring"))]
+impl TestTlsConfig {
+    pub(super) fn new() -> Self {
+        let cert_chain =
+            CertificateDer::pem_slice_iter(include_bytes!("../../../assets/example.com.crt"))
+                .collect::<Result<Vec<_>, _>>()
+                .expect("parse test certificate");
+        let private_key =
+            PrivateKeyDer::from_pem_slice(include_bytes!("../../../assets/example.com.key"))
+                .expect("parse test private key");
+
+        Self {
+            server: TlsServerConfig::new()
+                .with_single_cert(ServerAuthData::new(cert_chain, private_key))
+                .with_alpn_http_1(),
+            certificate_file: workspace_root().join("examples/assets/example.com.crt"),
+        }
+    }
+
+    pub(super) fn certificate_file_path(&self) -> &std::path::Path {
+        &self.certificate_file
     }
 }
 
@@ -356,7 +447,7 @@ fn map_internal_client_error<E, Body>(
 ) -> Result<Response, rama::error::BoxError>
 where
     E: Into<rama::error::BoxError>,
-    Body: StreamingBody<Data = bytes::Bytes, Error: Into<BoxError>> + Send + Sync + 'static,
+    Body: StreamingBody<Data = rama::bytes::Bytes, Error: Into<BoxError>> + Send + Sync + 'static,
 {
     match result {
         Ok(response) => Ok(response.map(rama::http::Body::new)),

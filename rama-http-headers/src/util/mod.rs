@@ -4,6 +4,7 @@ use crate::Error;
 
 //pub use self::charset::Charset;
 //pub use self::encoding::Encoding;
+pub(crate) use self::byte::is_http_token_byte;
 pub(crate) use self::entity::{EntityTag, EntityTagRange};
 pub(crate) use self::flat_csv::{
     FlatCsvSeparator, try_decode_flat_csv_header_values_as_non_empty_smallvec,
@@ -14,6 +15,9 @@ pub(crate) use self::flat_csv::{
 };
 pub(crate) use self::fmt::fmt;
 pub use self::http_date::HttpDate;
+pub(crate) use self::http_syntax::{
+    ListMembers, QuotedString, scan_quoted_string, skip_ows, trim_ows,
+};
 pub(crate) use self::iter::IterExt;
 //pub use language_tags::LanguageTag;
 //pub use self::quality_value::{Quality, QualityValue};
@@ -21,12 +25,14 @@ pub use self::flat_csv::ValuesOrAny;
 pub use self::seconds::Seconds;
 
 //mod charset;
+mod byte;
 pub mod csv;
 //mod encoding;
 mod entity;
 mod flat_csv;
 mod fmt;
 mod http_date;
+mod http_syntax;
 mod iter;
 //mod quality_value;
 mod seconds;

@@ -3,13 +3,13 @@ use rama::{
     Layer,
     http::service::web::response::Json,
     http::{BodyExtractExt, Request, server::HttpServer},
-    net::address::ProxyAddress,
+    net::{address::ProxyAddress, client::ProxyRoute},
     rt::Executor,
     service::service_fn,
     tcp::server::TcpListener,
     tls::KeyLogIntent,
     tls::rustls::server::TlsAcceptorLayer,
-    tls::server::{SelfSignedData, TlsServerConfig},
+    tls::server::{GeneratedServerAuthConfig, TlsServerConfig},
 };
 use serde_json::{Value, json};
 
@@ -34,10 +34,7 @@ async fn test_http_mitm_proxy() {
     });
 
     let data = TlsServerConfig::new()
-        .try_with_self_signed(SelfSignedData {
-            organisation_name: Some("Example Server Acceptor".to_owned()),
-            ..Default::default()
-        })
+        .try_with_generated_server_auth(GeneratedServerAuthConfig::default())
         .expect("self-signed")
         .with_alpn_http_auto()
         .with_keylog(KeyLogIntent::Environment);
@@ -67,7 +64,9 @@ async fn test_http_mitm_proxy() {
         // test http request proxy flow
         let result = runner
             .get("http://127.0.0.1:63005/foo/bar")
-            .extension(ProxyAddress::try_from("http://john:secret@127.0.0.1:62019").unwrap())
+            .extension(ProxyRoute::Proxy(
+                ProxyAddress::try_from("http://john:secret@127.0.0.1:62019").unwrap(),
+            ))
             .send()
             .await
             .unwrap()
@@ -80,7 +79,9 @@ async fn test_http_mitm_proxy() {
         // test https request proxy flow
         let result = runner
             .get("https://127.0.0.1:63006/foo/bar")
-            .extension(ProxyAddress::try_from("http://john:secret@127.0.0.1:62019").unwrap())
+            .extension(ProxyRoute::Proxy(
+                ProxyAddress::try_from("http://john:secret@127.0.0.1:62019").unwrap(),
+            ))
             .send()
             .await
             .unwrap()

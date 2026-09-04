@@ -16,7 +16,7 @@ use rama_core::error::BoxErrorExt as _;
 use rama_core::error::{BoxError, ErrorContext, ErrorExt};
 use rama_core::extensions::{Extension, Extensions, ExtensionsRef};
 use rama_core::telemetry::tracing::trace;
-use rama_utils::macros::generate_set_and_with;
+use rama_utils::{guard::DropGuard, macros::generate_set_and_with};
 use std::collections::VecDeque;
 use std::fmt::Debug;
 use std::mem::ManuallyDrop;
@@ -40,6 +40,7 @@ pub struct LeasedConnection<C: ExtensionsRef, ID> {
     active_slot: ActiveSlot,
     returner: ConnReturner<C, ID>,
     got_response: AtomicBool,
+    failed_or_cancelled: AtomicBool,
     drop_connection_if_no_response: bool,
 }
 
@@ -80,6 +81,7 @@ impl<C: ExtensionsRef, ID> ExtensionsRef for PooledConnection<C, ID> {
 /// Connection pool that uses LRU to evict connections
 pub struct LruDropPool<C, ID> {
     storage: Arc<Mutex<VecDeque<PooledConnection<C, ID>>>>,
+    retired: Arc<AtomicBool>,
     total_slots: Arc<Semaphore>,
     active_slots: Arc<Semaphore>,
     idle_timeout: Option<Duration>,
@@ -100,22 +102,30 @@ pub enum ReuseStrategy {
 
 struct ConnReturner<C, ID> {
     weak_storage: Weak<Mutex<VecDeque<PooledConnection<C, ID>>>>,
+    retired: Arc<AtomicBool>,
 }
 
 impl<C, ID> Clone for ConnReturner<C, ID> {
     fn clone(&self) -> Self {
         Self {
             weak_storage: self.weak_storage.clone(),
+            retired: self.retired.clone(),
         }
     }
 }
 
 impl<C, ID> ConnReturner<C, ID> {
     fn return_conn(&self, mut conn: PooledConnection<C, ID>) {
+        if self.retired.load(Ordering::Acquire) {
+            return;
+        }
         if let Some(storage) = self.weak_storage.upgrade() {
             // Ensure correct ordering by locking storage before loading the
             // last used time.
             let mut storage = storage.lock();
+            if self.retired.load(Ordering::Acquire) {
+                return;
+            }
             conn.last_used = Instant::now();
             storage.push_front(conn);
         }
@@ -126,6 +136,7 @@ impl<C, ID> Clone for LruDropPool<C, ID> {
     fn clone(&self) -> Self {
         Self {
             storage: self.storage.clone(),
+            retired: self.retired.clone(),
             total_slots: self.total_slots.clone(),
             active_slots: self.active_slots.clone(),
             returner: self.returner.clone(),
@@ -156,9 +167,14 @@ impl<C, ID> LruDropPool<C, ID> {
         }
         let storage = Arc::new(Mutex::new(VecDeque::with_capacity(max_total)));
         let weak_storage = Arc::downgrade(&storage);
+        let retired = Arc::new(AtomicBool::new(false));
         Ok(Self {
             storage,
-            returner: ConnReturner { weak_storage },
+            retired: retired.clone(),
+            returner: ConnReturner {
+                weak_storage,
+                retired,
+            },
             total_slots: Arc::new(Semaphore::const_new(max_total)),
             active_slots: Arc::new(Semaphore::const_new(max_active)),
             idle_timeout: None,
@@ -167,6 +183,16 @@ impl<C, ID> LruDropPool<C, ID> {
             #[cfg(feature = "opentelemetry")]
             metrics: None,
         })
+    }
+
+    /// Retire this pool generation and close every idle connection.
+    ///
+    /// Connections that are currently leased are closed when returned. New
+    /// acquisitions fail, including acquisitions through another clone of
+    /// this pool.
+    pub fn retire(&self) {
+        self.retired.store(true, Ordering::Release);
+        self.storage.lock().clear();
     }
 
     generate_set_and_with! {
@@ -221,6 +247,11 @@ where
         &self,
         id: &ID,
     ) -> Result<ConnectionResult<Self::Connection, Self::CreatePermit>, BoxError> {
+        if self.retired.load(Ordering::Acquire) {
+            return Err(BoxError::from_static_str(
+                "connection pool has been retired",
+            ));
+        }
         #[cfg(feature = "opentelemetry")]
         let metrics = self
             .metrics
@@ -246,6 +277,11 @@ where
         };
 
         let mut storage = self.storage.lock();
+        if self.retired.load(Ordering::Acquire) {
+            return Err(BoxError::from_static_str(
+                "connection pool has been retired",
+            ));
+        }
 
         if let Some(timeout) = self.idle_timeout {
             // Since new connections are always returned to the front of the
@@ -302,6 +338,7 @@ where
                 pooled_conn_taken: false,
                 returner: self.returner.clone(),
                 got_response: AtomicBool::new(false),
+                failed_or_cancelled: AtomicBool::new(false),
                 drop_connection_if_no_response: self.drop_connection_if_no_response,
             }));
         }
@@ -353,6 +390,7 @@ where
             }),
             pooled_conn_taken: false,
             got_response: AtomicBool::new(false),
+            failed_or_cancelled: AtomicBool::new(false),
             drop_connection_if_no_response: self.drop_connection_if_no_response,
         }
     }
@@ -409,8 +447,13 @@ impl<C: ExtensionsRef, ID> AsMut<C> for LeasedConnection<C, ID> {
 impl<C: ExtensionsRef, ID> Drop for LeasedConnection<C, ID> {
     fn drop(&mut self) {
         if !self.pooled_conn_taken {
-            if self.drop_connection_if_no_response && !self.got_response.load(Ordering::Relaxed) {
-                trace!("LRU connection pool: dropping connection that didn't receive a response");
+            if self.drop_connection_if_no_response
+                && (!self.got_response.load(Ordering::Relaxed)
+                    || self.failed_or_cancelled.load(Ordering::Relaxed))
+            {
+                trace!(
+                    "LRU connection pool: dropping connection with no response or a failed request"
+                );
                 unsafe { ManuallyDrop::drop(&mut self.pooled_conn) };
                 return;
             }
@@ -523,10 +566,17 @@ where
     type Error = C::Error;
 
     async fn serve(&self, input: Input) -> Result<Self::Output, Self::Error> {
-        self.got_response.store(false, Ordering::Relaxed);
+        // Failure is sticky for the whole lease. A later successful call must
+        // not make a connection reusable after another concurrent or earlier
+        // call failed or was cancelled.
+        let failed_or_cancelled = &self.failed_or_cancelled;
+        let mut failure_guard = DropGuard::new(move || {
+            failed_or_cancelled.store(true, Ordering::Relaxed);
+        });
         let result = self.as_ref().serve(input).await;
         if result.is_ok() {
             self.got_response.store(true, Ordering::Relaxed);
+            failure_guard.disarm();
         }
         result
     }
@@ -592,7 +642,7 @@ mod tests {
         convert::Infallible,
         sync::atomic::{AtomicI16, Ordering},
     };
-    use tokio_test::{assert_err, assert_ok};
+    use tokio_test::assert_ok;
 
     struct TestService {
         pub created_connection: AtomicI16,
@@ -624,6 +674,23 @@ mod tests {
     impl ExtensionsRef for Conn {
         fn extensions(&self) -> &Extensions {
             &self.extensions
+        }
+    }
+
+    impl Service<(bool, Duration)> for Conn {
+        type Output = ();
+        type Error = BoxError;
+
+        async fn serve(
+            &self,
+            (should_error, delay): (bool, Duration),
+        ) -> Result<Self::Output, Self::Error> {
+            tokio::time::sleep(delay).await;
+            if should_error {
+                Err(BoxError::from_static_str("request failed"))
+            } else {
+                Ok(())
+            }
         }
     }
 
@@ -769,13 +836,44 @@ mod tests {
             .unwrap();
 
         let conn2 = svc.connect(ServiceInput::new(String::from("a"))).await;
-        assert_err!(conn2);
+        let _error = conn2.unwrap_err();
 
         drop(conn1);
         let _conn3 = svc
             .connect(ServiceInput::new(String::from("aaa")))
             .await
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn retired_pool_closes_idle_and_rejects_returned_connections() {
+        let pool = LruDropPool::try_new(2, 2)
+            .unwrap()
+            .with_drop_connection_if_no_response(false);
+        let svc =
+            PooledConnector::new(TestService::default(), pool.clone(), StringInputLengthID {});
+
+        let idle = svc
+            .connect(ServiceInput::new(String::from("a")))
+            .await
+            .unwrap()
+            .conn;
+        drop(idle);
+        let active = svc
+            .connect(ServiceInput::new(String::from("bb")))
+            .await
+            .unwrap()
+            .conn;
+        assert_eq!(pool.storage.lock().len(), 1);
+
+        pool.retire();
+        assert!(pool.storage.lock().is_empty());
+        drop(active);
+        assert!(pool.storage.lock().is_empty());
+        match svc.connect(ServiceInput::new(String::from("ccc"))).await {
+            Err(_) => {}
+            Ok(_) => panic!("a retired pool accepted a new acquisition"),
+        }
     }
 
     #[derive(Default)]
@@ -912,6 +1010,31 @@ mod tests {
         assert_ok!(conn.conn.serve(false).await);
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn failed_request_stays_sticky_after_concurrent_success() {
+        let pool = LruDropPool::try_new(1, 1).unwrap();
+        let svc = PooledConnector::new(TestService::default(), pool, StringInputLengthID {});
+
+        let conn = svc.connect(ServiceInput::new(String::new())).await.unwrap();
+
+        // The failure resolves first and the success resolves last. The old
+        // last-writer-wins flag therefore returned this lease to the pool.
+        let (failed, succeeded) = tokio::join!(
+            conn.conn.serve((true, Duration::from_millis(10))),
+            conn.conn.serve((false, Duration::from_millis(20))),
+        );
+        assert!(failed.is_err());
+        assert_ok!(succeeded);
+        drop(conn);
+
+        let _fresh = svc.connect(ServiceInput::new(String::new())).await.unwrap();
+        assert_eq!(
+            svc.inner.created_connection.load(Ordering::Relaxed),
+            2,
+            "any failed request must poison the lease despite a later response"
+        );
+    }
+
     #[tokio::test]
     async fn test_dont_return_broken_connections_to_pool() {
         let pool = LruDropPool::try_new(1, 1).unwrap();
@@ -925,7 +1048,7 @@ mod tests {
         let result = conn.conn.serve(false).await;
         assert_ok!(result);
         let result = conn.conn.serve(true).await;
-        assert_err!(result);
+        let _error = result.unwrap_err();
 
         // this dropped connection should not return to the pool, otherwise it will be permanently broken
         drop(conn);

@@ -12,6 +12,7 @@ pub mod echo;
 pub mod fp;
 pub mod fs;
 pub mod httptest;
+pub mod icap;
 pub mod ip;
 pub mod proxy;
 pub mod stunnel;
@@ -48,9 +49,10 @@ pub async fn run(cfg: ServeCommand) -> Result<(), BoxError> {
         ServeSubcommand::Echo(cfg) => echo::run(graceful.guard(), etx, cfg).await?,
         ServeSubcommand::Fp(cfg) => fp::run(graceful.guard(), cfg).await?,
         ServeSubcommand::HttpTest(cfg) => httptest::run(graceful.guard(), cfg).await?,
+        ServeSubcommand::Icap(cfg) => icap::run(graceful.guard(), cfg).await?,
         ServeSubcommand::Fs(cfg) => fs::run(graceful.guard(), cfg).await?,
         ServeSubcommand::Ip(cfg) => ip::run(graceful.guard(), cfg).await?,
-        ServeSubcommand::Proxy(cfg) => proxy::run(graceful.guard(), cfg).await?,
+        ServeSubcommand::Proxy(cfg) => proxy::run(graceful.guard(), *cfg).await?,
         ServeSubcommand::Stunnel(cfg) => stunnel::run(graceful.guard(), cfg).await?,
     }
 
@@ -85,8 +87,9 @@ pub enum ServeSubcommand {
     Echo(echo::CliCommandEcho),
     Fp(fp::CliCommandFingerprint),
     HttpTest(httptest::CliCommandHttpTest),
+    Icap(icap::CliCommandIcap),
     Fs(fs::CliCommandFs),
     Ip(ip::CliCommandIp),
-    Proxy(proxy::CliCommandProxy),
+    Proxy(Box<proxy::CliCommandProxy>),
     Stunnel(stunnel::StunnelCommand),
 }

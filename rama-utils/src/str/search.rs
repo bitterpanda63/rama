@@ -1,3 +1,13 @@
+use core::cmp::Ordering;
+
+/// Compare two byte strings lexicographically under ASCII case folding.
+#[must_use]
+pub fn cmp_ignore_ascii_case(lhs: &[u8], rhs: &[u8]) -> Ordering {
+    lhs.iter()
+        .map(u8::to_ascii_lowercase)
+        .cmp(rhs.iter().map(u8::to_ascii_lowercase))
+}
+
 /// Returns `true` if `lhs` and `rhs` are byte-for-byte equal under ASCII
 /// case folding. `const fn`, so usable in `const` contexts where std's
 /// [`<[u8]>::eq_ignore_ascii_case`] isn't yet available.
@@ -10,6 +20,34 @@ pub const fn eq_ignore_ascii_case(lhs: &[u8], rhs: &[u8]) -> bool {
     while i < lhs.len() {
         let l = lhs[i].to_ascii_lowercase();
         let r = rhs[i].to_ascii_lowercase();
+        if l != r {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Returns `true` if `lhs` and `rhs` are byte-for-byte equal under ASCII
+/// case folding, additionally treating `-` and `_` as equal.
+///
+/// This is the comparison used by rama's kebab-case name grammars
+/// (e.g. flag and scope names), so that snake_case input matches too.
+#[must_use]
+pub const fn eq_ignore_ascii_kebab_case(lhs: &[u8], rhs: &[u8]) -> bool {
+    if lhs.len() != rhs.len() {
+        return false;
+    }
+    let mut i = 0;
+    while i < lhs.len() {
+        let mut l = lhs[i].to_ascii_lowercase();
+        let mut r = rhs[i].to_ascii_lowercase();
+        if l == b'_' {
+            l = b'-';
+        }
+        if r == b'_' {
+            r = b'-';
+        }
         if l != r {
             return false;
         }
@@ -176,7 +214,30 @@ where
 
 #[cfg(test)]
 mod tests {
+    use core::cmp::Ordering;
+
+    #[test]
+    fn test_cmp_ignore_ascii_case() {
+        assert_eq!(
+            super::cmp_ignore_ascii_case(b"allow", b"ALLOW"),
+            Ordering::Equal
+        );
+        assert_eq!(super::cmp_ignore_ascii_case(b"a", b"BB"), Ordering::Less);
+        assert_eq!(super::cmp_ignore_ascii_case(b"CC", b"b"), Ordering::Greater);
+    }
+
     use super::*;
+
+    #[test]
+    fn test_eq_ignore_ascii_kebab_case() {
+        assert!(eq_ignore_ascii_kebab_case(b"link-local", b"link-local"));
+        assert!(eq_ignore_ascii_kebab_case(b"LINK_LOCAL", b"link-local"));
+        assert!(eq_ignore_ascii_kebab_case(b"Link-Local", b"link_local"));
+        assert!(!eq_ignore_ascii_kebab_case(b"link-local", b"linklocal"));
+        assert!(!eq_ignore_ascii_kebab_case(b"link", b"link-local"));
+        assert!(!eq_ignore_ascii_kebab_case(b"private", b"privatx"));
+        assert!(eq_ignore_ascii_kebab_case(b"", b""));
+    }
 
     fn assert_contains_cases(s: &str, sub: &str, expected: Option<usize>) {
         assert_eq!(

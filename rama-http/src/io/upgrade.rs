@@ -66,6 +66,17 @@ use rama_utils::macros::generate_set_and_with;
 pub struct Upgraded {
     io: Rewind<Box<dyn UpgradeIo>>,
     extensions: Extensions,
+    _guards: Vec<OpaqueGuard>,
+}
+
+struct OpaqueGuard {
+    _guard: Box<dyn Send + 'static>,
+}
+
+impl fmt::Debug for OpaqueGuard {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("OpaqueGuard").finish_non_exhaustive()
+    }
 }
 
 /// A future for a possible HTTP upgrade.
@@ -97,6 +108,8 @@ pub struct Parts<T> {
     pub read_buf: Bytes,
     /// Extensions associated with this upgrade
     pub extensions: Extensions,
+    /// Opaque resources whose lifetime is bound to the upgraded transport.
+    _guards: Vec<OpaqueGuard>,
 }
 
 /// Gets a pending HTTP upgrade from this message and handles it.
@@ -158,22 +171,30 @@ pub fn pending() -> (Pending, OnUpgrade) {
 impl Upgraded {
     /// Create a new [`Upgraded`] from an IO stream and existing buffer.
     ///
-    /// The [`Upgraded`] starts with the io [`Extensions`]s. When
-    /// driven through [`handle_upgrade`] the parent is set to the message
-    /// that triggered the upgrade (which already encodes the underlying
-    /// connection through its `Ingress` / `Egress` wrapper), so the upgraded
-    /// blob inherits everything reachable from that message.
+    /// The [`Upgraded`] starts with a fork of the io [`Extensions`]: reads
+    /// resolve through the io's chain — including the consumed HTTP
+    /// connection's state such as its (typically broken)
+    /// `ConnectionHealthWatcher` and its `MaxConcurrency` — but inserts land
+    /// on the upgraded stream's own level. The fork is what lets a protocol
+    /// handshake built on top install fresh per-connection state that shadows
+    /// the consumed connection's (see `ConnectionHealthWatcher::install`)
+    /// instead of mutating it; until such state is installed, lookups keep
+    /// returning the inherited values. Message extensions are not copied by
+    /// [`handle_upgrade`]: they can contain structural `Ingress` / `Egress`
+    /// links back to this same io. A protocol-specific upgrade handler can
+    /// explicitly transfer the typed message extensions it needs.
     pub fn new<T>(io: T, read_buf: Bytes) -> Self
     where
         T: Io + Unpin + ExtensionsRef,
     {
-        let extensions = io.extensions().clone();
+        let extensions = io.extensions().fork();
         extensions.insert(StreamTransformed {
             by: "rama-http::Upgraded",
         });
         Self {
             extensions,
             io: Rewind::new_buffered(Box::new(io), read_buf),
+            _guards: Vec::new(),
         }
     }
 
@@ -184,21 +205,48 @@ impl Upgraded {
         }
     }
 
+    /// Bind an opaque resource to the lifetime of this upgraded transport.
+    ///
+    /// The resource is retained when the transport is downcast into [`Parts`]
+    /// and is released when the upgraded transport, or those parts, are
+    /// dropped. This is useful for leases that must remain active for as long
+    /// as the upgraded protocol is using the underlying connection.
+    #[must_use]
+    pub fn with_guard<G>(mut self, guard: G) -> Self
+    where
+        G: Send + 'static,
+    {
+        self._guards.push(OpaqueGuard {
+            _guard: Box::new(guard),
+        });
+        self
+    }
+
     /// Tries to downcast the internal trait object to the type passed.
     ///
-    /// On success, returns the downcasted parts. On error, returns the
-    /// `Upgraded` back.
+    /// On success, returns the downcasted parts.
+    ///
+    /// # Errors
+    ///
+    /// On error, returns the `Upgraded` back.
     pub fn downcast<T: Io + Unpin>(self) -> Result<Parts<T>, Self> {
-        let (io, buf) = self.io.into_inner();
+        let Self {
+            io,
+            extensions,
+            _guards: guards,
+        } = self;
+        let (io, buf) = io.into_inner();
         match io.__downcast() {
             Ok(t) => Ok(Parts {
                 io: *t,
                 read_buf: buf,
-                extensions: self.extensions,
+                extensions,
+                _guards: guards,
             }),
             Err(io) => Err(Self {
                 io: Rewind::new_buffered(io, buf),
-                extensions: self.extensions,
+                extensions,
+                _guards: guards,
             }),
         }
     }
@@ -356,6 +404,11 @@ impl Pending {
 #[cfg(test)]
 mod tests {
     use rama_core::ServiceInput;
+    use rama_core::extensions::Extension;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    };
     use tokio_test::io::{Builder, Mock};
 
     use super::*;
@@ -378,5 +431,50 @@ mod tests {
             .get_ref::<StreamTransformed>()
             .expect("Upgraded::new must insert the StreamTransformed marker");
         assert_eq!(marker.by, "rama-http::Upgraded");
+    }
+
+    #[test]
+    fn upgraded_guard_survives_downcast() {
+        struct DropFlag(Arc<AtomicBool>);
+
+        impl Drop for DropFlag {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::Release);
+            }
+        }
+
+        let dropped = Arc::new(AtomicBool::new(false));
+        let io = ServiceInput::new(Builder::default().build());
+        let upgraded = Upgraded::new(io, Bytes::new()).with_guard(DropFlag(dropped.clone()));
+
+        let upgraded = upgraded.downcast::<std::io::Cursor<Vec<u8>>>().unwrap_err();
+        assert!(!dropped.load(Ordering::Acquire));
+
+        let parts = upgraded.downcast::<ServiceInput<Mock>>().unwrap();
+        assert!(!dropped.load(Ordering::Acquire));
+        drop(parts);
+        assert!(dropped.load(Ordering::Acquire));
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq, Extension)]
+    struct MessageExtension(&'static str);
+
+    #[tokio::test]
+    async fn handle_upgrade_keeps_message_extensions_out_of_transport() {
+        let (pending, on_upgrade) = pending();
+        let extensions = Extensions::new();
+        extensions.insert(on_upgrade);
+        extensions.insert(MessageExtension("middleware"));
+        let io = ServiceInput::new(Builder::default().build());
+        pending.fulfill(Upgraded::new(io, Bytes::new()));
+
+        let upgraded = handle_upgrade(&extensions).await.unwrap();
+        assert!(
+            upgraded
+                .extensions()
+                .get_ref::<MessageExtension>()
+                .is_none(),
+            "message extensions may contain links back to the upgraded transport"
+        );
     }
 }

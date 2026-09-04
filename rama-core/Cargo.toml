@@ -51,16 +51,16 @@ opentelemetry = [
     "dep:opentelemetry_sdk",
     "dep:tracing-opentelemetry",
 ]
-# Route task spawns through `dial9-tokio-telemetry::spawn` so they pick
-# up wake-event tracking when a `TracedRuntime` is active. Inert when
-# no traced runtime is present. Requires `--cfg tokio_unstable`.
-dial9 = ["std", "dep:dial9-tokio-telemetry", "dep:dial9-trace-format"]
+# Route task spawns through `dial9::spawn` so they pick
+# up wake-event tracking when a recorder is attached. Inert when
+# no traced runtime is present. `--cfg tokio_unstable` widens dial9's task coverage.
+dial9 = ["std", "dep:dial9", "dep:dial9-trace-format"]
 
 [dependencies]
 ahash = { workspace = true, optional = true }
 asynk-strim = { workspace = true }
-bytes = { version = "1", default-features = false }
-dial9-tokio-telemetry = { workspace = true, optional = true }
+bytes = { workspace = true }
+dial9 = { workspace = true, optional = true }
 dial9-trace-format = { workspace = true, optional = true }
 futures = { version = "0.3", default-features = false, features = ["alloc", "async-await"] }
 opentelemetry = { workspace = true, optional = true }
@@ -73,7 +73,7 @@ rama-macros = { workspace = true }
 rama-utils = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true, optional = true }
-tokio = { workspace = true, features = ["macros", "fs", "io-std"], optional = true }
+tokio = { workspace = true, features = ["macros", "fs", "io-std", "rt", "rt-multi-thread", "sync", "time"], optional = true }
 tokio-graceful = { workspace = true, optional = true }
 tokio-stream = { workspace = true, features = ["full"], optional = true }
 tokio-util = { workspace = true, features = ["codec", "io", "io-util"], optional = true }

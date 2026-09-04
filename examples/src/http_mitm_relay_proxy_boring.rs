@@ -1,11 +1,10 @@
-//! This example shows how one can begin with creating a MITM proxy,
-//! using a relay approach. This in contrast to `http_mitm_proxy_boring`,
-//! where the flow is rather linear, here the approach is to handshake more like a dance.
+//! This example builds on Rama's Relay/Peek architecture to demonstrate egress
+//! request shaping and inspection. CONNECT establishes egress before returning
+//! success and hands the resulting ingress/egress pair to the protocol relays.
 //!
-//! It is as such a more complex flow, but the advantage is that your proxy's
-//! TLS acceptor will mimic the certificate and server (TLS) settings from
-//! the target and the http client (egress) will nicely be 1:1 tied
-//! the ingress traffic and mirror it.
+//! The TLS relay mirrors the ingress ClientHello and target certificate, while
+//! HTTP middleware auto-detects the user-agent profile, emulates its outgoing
+//! request headers, and prints the final egress headers.
 //!
 //! Note that this proxy is not production ready, and is only meant
 //! to show you how one might start.
@@ -40,26 +39,32 @@ use rama::{
         layer::{
             map_response_body::MapResponseBodyLayer,
             proxy_auth::ProxyAuthLayer,
+            remove_header::{RemoveRequestHeaderLayer, RemoveResponseHeaderLayer},
             set_header::{SetRequestHeaderLayer, SetResponseHeaderLayer},
             trace::TraceLayer,
-            upgrade::{DefaultHttpProxyConnectReplyService, UpgradeLayer},
+            traffic_writer::{self, RequestWriterLayer},
+            upgrade::{EagerHttpProxyConnector, UpgradeLayer},
         },
         matcher::MethodMatcher,
         proxy::mitm::{DefaultErrorResponse, HttpMitmRelay},
         server::HttpServer,
     },
-    io::Io,
-    layer::{ArcLayer, ConsumeErrLayer, MapOutputLayer},
+    io::{BridgeIo, Io},
+    layer::{ArcLayer, ConsumeErrLayer, MapOutputLayer, TimeoutLayer},
     net::{http::server::HttpPeekRouter, proxy::IoForwardService, user::credentials::basic},
     rt::Executor,
-    tcp::{proxy::IoToProxyBridgeIoLayer, server::TcpListener},
+    tcp::server::TcpListener,
     telemetry::tracing::{
         self,
         level_filters::LevelFilter,
         subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt},
     },
     tls::boring::proxy::TlsMitmRelay,
-    tls::server::{PeekTlsClientHelloService, SelfSignedData},
+    tls::server::{CertificateSubject, PeekTlsClientHelloService, SelfSignedCaConfig},
+    ua::{
+        layer::emulate::{UserAgentEmulateHttpRequestModifierLayer, UserAgentEmulateLayer},
+        profile::UserAgentDatabase,
+    },
     utils::octets::mib,
 };
 
@@ -79,7 +84,9 @@ async fn main() -> Result<(), BoxError> {
     let graceful = rama::graceful::Shutdown::default();
     let exec = Executor::graceful(graceful.guard());
 
-    let mitm_svc = new_mitm_svc(&exec).context("build MITM service")?;
+    let ua_db =
+        Arc::new(UserAgentDatabase::try_embedded().context("load embedded user-agent database")?);
+    let mitm_svc = new_mitm_svc(&exec, ua_db).context("build MITM service")?;
 
     graceful.spawn_task_fn(async move |guard| {
         let tcp_service = TcpListener::build(Executor::graceful(guard.clone()))
@@ -87,6 +94,14 @@ async fn main() -> Result<(), BoxError> {
             .await
             .expect("bind tcp proxy to 127.0.0.1:62049");
 
+        let connect = EagerHttpProxyConnector::new(
+            TimeoutLayer::new(Duration::from_secs(30)).into_layer(
+                rama::dns::client::DnsConnector::new(
+                    rama::tcp::client::service::TcpConnector::new(),
+                ),
+            ),
+            mitm_svc,
+        );
         let http_service = HttpServer::auto(exec).service(Arc::new(
             (
                 TraceLayer::new_for_http(),
@@ -97,10 +112,10 @@ async fn main() -> Result<(), BoxError> {
                 UpgradeLayer::new(
                     Executor::graceful(guard.clone()),
                     MethodMatcher::CONNECT,
-                    DefaultHttpProxyConnectReplyService::new(),
-                    mitm_svc,
+                    connect,
                 ),
                 (
+                    RemoveRequestHeaderLayer::hop_by_hop(),
                     SetRequestHeaderLayer::overriding(
                         HeaderName::from_static("x-observed"),
                         HeaderValue::from_static("1"),
@@ -113,6 +128,7 @@ async fn main() -> Result<(), BoxError> {
                         HeaderName::from_static("x-proxy-version"),
                         HeaderValue::from_static(rama::utils::info::VERSION),
                     ),
+                    RemoveResponseHeaderLayer::hop_by_hop(),
                 ),
             )
                 .into_layer(EasyHttpWebClient::default_with_executor(
@@ -133,17 +149,30 @@ async fn main() -> Result<(), BoxError> {
     Ok(())
 }
 
-fn new_mitm_svc<Ingress: Io + Unpin + ExtensionsRef>(
+fn new_mitm_svc<Ingress, Egress>(
     exec: &Executor,
-) -> Result<impl Service<Ingress, Output = (), Error = Infallible> + Clone, BoxError> {
+    ua_db: Arc<UserAgentDatabase>,
+) -> Result<
+    impl Service<BridgeIo<Ingress, Egress>, Output = (), Error = Infallible> + Clone,
+    BoxError,
+>
+where
+    Ingress: Io + Unpin + ExtensionsRef,
+    Egress: Io + Unpin + ExtensionsRef,
+{
     let http_mitm_relay = HttpMitmRelay::new(exec.clone()).with_http_middleware((
         ConsumeErrLayer::trace_as_debug().with_response(DefaultErrorResponse::new()),
         MapResponseBodyLayer::new_boxed_streaming_body(),
         TraceLayer::new_for_http(),
+        UserAgentEmulateLayer::new(ua_db)
+            .with_try_auto_detect_user_agent(true)
+            .with_is_optional(true),
         SetRequestHeaderLayer::overriding(
             HeaderName::from_static("x-observed"),
             HeaderValue::from_static("1"),
         ),
+        UserAgentEmulateHttpRequestModifierLayer::default(),
+        RequestWriterLayer::stdout_unbounded(exec, Some(traffic_writer::WriterMode::Headers)),
         SetResponseHeaderLayer::overriding(
             HeaderName::from_static("x-proxy"),
             HeaderValue::from_static(rama::utils::info::NAME),
@@ -155,27 +184,24 @@ fn new_mitm_svc<Ingress: Io + Unpin + ExtensionsRef>(
         ArcLayer::new(),
     ));
     let maybe_http_relay = HttpPeekRouter::new(http_mitm_relay)
+        .with_known_non_http_protocol_methods()
         .with_fallback(MapOutputLayer::new(drop).into_layer(IoForwardService::new(exec.clone())));
 
-    let tls_mitm_relay = TlsMitmRelay::try_new_with_cached_self_signed_issuer(&SelfSignedData {
-        organisation_name: Some("HTTP MITM Relay Proxy Boring Example".to_owned()),
-        ..Default::default()
-    })
-    .context("build TLS mitm relay")?;
+    let tls_mitm_relay =
+        TlsMitmRelay::try_new_with_cached_self_signed_issuer(&SelfSignedCaConfig {
+            subject: CertificateSubject {
+                organisation_name: Some("HTTP MITM Relay Proxy Boring Example".to_owned()),
+                ..Default::default()
+            },
+            ..Default::default()
+        })
+        .context("build TLS mitm relay")?;
 
     let app_mitm_layer =
         PeekTlsClientHelloService::new(tls_mitm_relay.into_layer(maybe_http_relay.clone()))
             .with_fallback(maybe_http_relay);
 
     Ok(Arc::new(
-        (
-            ConsumeErrLayer::trace_as_debug(),
-            IoToProxyBridgeIoLayer::extension_connector_target().with_connector(
-                rama::dns::client::DnsConnector::new(
-                    rama::tcp::client::service::TcpConnector::new(),
-                ),
-            ),
-        )
-            .into_layer(app_mitm_layer),
+        ConsumeErrLayer::trace_as_debug().into_layer(app_mitm_layer),
     ))
 }

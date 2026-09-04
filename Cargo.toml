@@ -5,6 +5,7 @@ documentation = "https://docs.rs/rama"
 description = "modular service framework"
 # We use examples/ as standalone crate, disable this so cargo doesn't also pick this up as examples here
 autoexamples = false
+autobenches = false
 version = { workspace = true }
 license = { workspace = true }
 edition = { workspace = true }
@@ -43,6 +44,7 @@ members = [
     "rama-fastcgi",
     "rama-grpc",
     "rama-grpc-build",
+    "rama-grpc-macros",
     "rama-haproxy",
     "rama-http",
     "rama-http-backend",
@@ -53,12 +55,15 @@ members = [
     "rama-http-hyperium",
     "rama-http-macros",
     "rama-http-types",
+    "rama-icap",
+    "rama-js",
     "rama-json",
     "rama-macros",
     "rama-macros/tests/macros",
     "rama-net",
     "rama-net-apple-networkextension",
     "rama-net-apple-xpc",
+    "rama-pac",
     "rama-proxy",
     "rama-socks5",
     "rama-tcp",
@@ -77,7 +82,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.3.1"
+version = "0.5.0"
 license = "MIT OR Apache-2.0"
 edition = "2024"
 repository = "https://github.com/plabayo/rama"
@@ -99,8 +104,8 @@ arc-swap = "1.9"
 async-compression = "0.4"
 asynk-strim = { version = "0.1" }
 atomic-waker = "1.1"
-aws-lc-rs = { version = "1.17", features = ["bindgen"] }
-aws-lc-sys = { version = "0.43", features = ["bindgen"] }
+aws-lc-rs = { version = "1.18", features = ["bindgen"] }
+aws-lc-sys = { version = "0.45", features = ["bindgen"] }
 base64 = "0.23"
 bb8 = "0.9"
 bb8-postgres = "0.9"
@@ -109,16 +114,17 @@ bitflags = "2.13"
 block2 = "0.6"
 brotli = "8"
 byteorder = "1.5"
-bytes = "1"
+bytes = { version = "1", default-features = false, features = ["serde"] }
 cc = "1"
 clap = { version = "4.6", features = ["derive", "unstable-v5", "wrap_help"] }
 compression-codecs = "0.4"
 compression-core = "0.4"
 const_format = "0.2"
+core-foundation = "0.10"
 csv = "1.4"
 derive_more = "2.1"
-dial9-tokio-telemetry = "0.3.15"
-dial9-trace-format = "0.4"
+dial9 = { version = "0.5.0", default-features = false, features = ["tokio"] }
+dial9-trace-format = "0.5.0"
 divan = "0.1"
 escargot = "0.5"
 flate2 = "1.1"
@@ -133,7 +139,7 @@ hickory-resolver = { version = "0.26.1", default-features = false, features = ["
 honggfuzz = "0.5"
 http = "1" # interop-only (rama-http-hyperium / rama-tower); native rama Uri handles CONNECT, so no version pin needed
 http-body = "1" # interop-only (rama-http-hyperium body bridge)
-http-range-header = "0.4"
+http-range-header = "0.4.2"
 httparse = "1.10"
 httpdate = "1.0"
 idna = "1"
@@ -144,6 +150,7 @@ itertools = "0.15"
 itoa = "1"
 jemallocator = { package = "tikv-jemallocator", version = "0.6" }
 jiff = { version = "0.2.35", features = ["serde"] }
+jni = "0.22"
 libc = "0.2"
 libfuzzer-sys = "0.4"
 loom = "0.7"
@@ -155,13 +162,14 @@ mime = "0.3.17"
 mime_guess = { version = "2", default-features = false }
 moka = "0.12"
 multer = "3.1"
+ndk-context = "0.1"
 nom = "8.0.0"
 openssl-probe = "0.2"
 opentelemetry = { version = "0.32", default-features = false, features = ["trace", "internal-logs"] }
 opentelemetry-semantic-conventions = { version = "0.32", features = ["semconv_experimental"] }
 opentelemetry_sdk = { version = "0.32", default-features = false, features = ["trace", "rt-tokio"] }
 parking_lot = "0.12"
-percent-encoding = "2.3"
+percent-encoding = { version = "2.3", default-features = false }
 pin-project-lite = "0.2"
 prettyplease = "0.3"
 proc-macro-crate = "3.5"
@@ -171,54 +179,59 @@ prost-build = "0.14.4"
 prost-types = "0.14.4"
 protoc-bin-vendored = "3.2.0"
 psl = "2"
-quick-xml = "0.41"
+quick-xml = "0.42"
 quickcheck = "1.1"
 quickcheck_macros = "1.2"
 quote = "1.0"
 radix_trie = "0.3"
-rama = { version = "0.3.1", path = ".", default-features = false }
-rama-boring = { version = "0.6.5", default-features = false }
-rama-boring-tokio = { version = "0.6.5", default-features = false }
-rama-core = { version = "0.3.1", path = "./rama-core", default-features = false }
-rama-crypto = { version = "0.3.1", path = "./rama-crypto", default-features = false }
-rama-dns = { version = "0.3.1", path = "./rama-dns", default-features = false }
-rama-error = { version = "0.3.1", path = "./rama-error", default-features = false }
-rama-fastcgi = { version = "0.3.1", path = "./rama-fastcgi", default-features = false }
-rama-grpc = { version = "0.3.1", path = "./rama-grpc", default-features = false }
-rama-grpc-build = { version = "0.3.1", path = "./rama-grpc-build", default-features = false }
-rama-haproxy = { version = "0.3.1", path = "./rama-haproxy", default-features = false }
-rama-http = { version = "0.3.1", path = "./rama-http", default-features = false }
-rama-http-backend = { version = "0.3.1", path = "./rama-http-backend", default-features = false }
-rama-http-core = { version = "0.3.1", path = "./rama-http-core", default-features = false }
-rama-http-headers = { version = "0.3.1", path = "./rama-http-headers", default-features = false }
-rama-http-hyperium = { version = "0.3.1", path = "./rama-http-hyperium", default-features = false }
-rama-http-macros = { version = "0.3.1", path = "./rama-http-macros", default-features = false }
-rama-http-types = { version = "0.3.1", path = "./rama-http-types", default-features = false }
-rama-json = { version = "0.3.1", path = "./rama-json", default-features = false }
-rama-macros = { version = "0.3.1", path = "./rama-macros", default-features = false }
-rama-net = { version = "0.3.1", path = "./rama-net", default-features = false }
-rama-net-apple-networkextension = { version = "0.3.1", path = "./rama-net-apple-networkextension", default-features = false }
-rama-net-apple-xpc = { version = "0.3.1", path = "./rama-net-apple-xpc", default-features = false }
-rama-proxy = { version = "0.3.1", path = "./rama-proxy", default-features = false }
-rama-socks5 = { version = "0.3.1", path = "./rama-socks5", default-features = false }
-rama-tcp = { version = "0.3.1", path = "./rama-tcp", default-features = false }
-rama-tls = { version = "0.3.1", path = "./rama-tls", default-features = false }
-rama-tls-acme = { version = "0.3.1", path = "./rama-tls-acme", default-features = false }
-rama-tls-boring = { version = "0.3.1", path = "./rama-tls-boring", default-features = false }
-rama-tls-rustls = { version = "0.3.1", path = "./rama-tls-rustls", default-features = false }
-rama-tower = { version = "0.3.1", path = "./rama-tower", default-features = false }
-rama-ttrpc = { version = "0.3.1", path = "./rama-ttrpc", default-features = false }
-rama-ttrpc-build = { version = "0.3.1", path = "./rama-ttrpc-build", default-features = false }
-rama-ua = { version = "0.3.1", path = "./rama-ua", default-features = false }
-rama-udp = { version = "0.3.1", path = "./rama-udp", default-features = false }
-rama-unix = { version = "0.3.1", path = "./rama-unix", default-features = false }
-rama-utils = { version = "0.3.1", path = "./rama-utils", default-features = false }
-rama-ws = { version = "0.3.1", path = "./rama-ws", default-features = false }
+rama = { version = "0.5.0", path = ".", default-features = false }
+rama-boring = { version = "0.6.8", default-features = false }
+rama-boring-tokio = { version = "0.6.8", default-features = false }
+rama-core = { version = "0.5.0", path = "./rama-core", default-features = false }
+rama-crypto = { version = "0.5.0", path = "./rama-crypto", default-features = false }
+rama-dns = { version = "0.5.0", path = "./rama-dns", default-features = false }
+rama-error = { version = "0.5.0", path = "./rama-error", default-features = false }
+rama-fastcgi = { version = "0.5.0", path = "./rama-fastcgi", default-features = false }
+rama-grpc = { version = "0.5.0", path = "./rama-grpc", default-features = false }
+rama-grpc-build = { version = "0.5.0", path = "./rama-grpc-build", default-features = false }
+rama-grpc-macros = { version = "0.5.0", path = "./rama-grpc-macros", default-features = false }
+rama-haproxy = { version = "0.5.0", path = "./rama-haproxy", default-features = false }
+rama-http = { version = "0.5.0", path = "./rama-http", default-features = false }
+rama-http-backend = { version = "0.5.0", path = "./rama-http-backend", default-features = false }
+rama-http-core = { version = "0.5.0", path = "./rama-http-core", default-features = false }
+rama-http-headers = { version = "0.5.0", path = "./rama-http-headers", default-features = false }
+rama-http-hyperium = { version = "0.5.0", path = "./rama-http-hyperium", default-features = false }
+rama-http-macros = { version = "0.5.0", path = "./rama-http-macros", default-features = false }
+rama-http-types = { version = "0.5.0", path = "./rama-http-types", default-features = false }
+rama-icap = { version = "0.5.0", path = "./rama-icap", default-features = false }
+rama-js = { version = "0.5.0", path = "./rama-js", default-features = false }
+rama-json = { version = "0.5.0", path = "./rama-json", default-features = false }
+rama-macros = { version = "0.5.0", path = "./rama-macros", default-features = false }
+rama-net = { version = "0.5.0", path = "./rama-net", default-features = false }
+rama-net-apple-networkextension = { version = "0.5.0", path = "./rama-net-apple-networkextension", default-features = false }
+rama-net-apple-xpc = { version = "0.5.0", path = "./rama-net-apple-xpc", default-features = false }
+rama-pac = { version = "0.5.0", path = "./rama-pac", default-features = false }
+rama-proxy = { version = "0.5.0", path = "./rama-proxy", default-features = false }
+rama-socks5 = { version = "0.5.0", path = "./rama-socks5", default-features = false }
+rama-tcp = { version = "0.5.0", path = "./rama-tcp", default-features = false }
+rama-tls = { version = "0.5.0", path = "./rama-tls", default-features = false }
+rama-tls-acme = { version = "0.5.0", path = "./rama-tls-acme", default-features = false }
+rama-tls-boring = { version = "0.5.0", path = "./rama-tls-boring", default-features = false }
+rama-tls-rustls = { version = "0.5.0", path = "./rama-tls-rustls", default-features = false }
+rama-tower = { version = "0.5.0", path = "./rama-tower", default-features = false }
+rama-ttrpc = { version = "0.5.0", path = "./rama-ttrpc", default-features = false }
+rama-ttrpc-build = { version = "0.5.0", path = "./rama-ttrpc-build", default-features = false }
+rama-ua = { version = "0.5.0", path = "./rama-ua", default-features = false }
+rama-udp = { version = "0.5.0", path = "./rama-udp", default-features = false }
+rama-unix = { version = "0.5.0", path = "./rama-unix", default-features = false }
+rama-utils = { version = "0.5.0", path = "./rama-utils", default-features = false }
+rama-ws = { version = "0.5.0", path = "./rama-ws", default-features = false }
 rand = "0.10"
 ratatui = "0.30"
 rawzip = { version = "0.5" }
 rcgen = { version = "0.14", default-features = false, features = ["pem", "x509-parser"] }
 regex = { version = "1.13", default-features = false }
+regex-automata = { version = "0.4.18", default-features = false, features = ["hybrid", "meta", "perf", "std"] }
 rustls = { version = "0.23", default-features = false, features = ["logging", "std", "tls12"] }
 rustls-pki-types = "^1"
 rustversion = "1.0"
@@ -239,7 +252,6 @@ spmc = "0.3"
 static_assertions = "1"
 syn = "3.0"
 sync_wrapper = "1.0"
-tempfile = "3.27"
 terminal-prompt = "0.2"
 # TEMPORARY: see https://github.com/time-rs/time/issues/783.
 time = "=0.3.47"
@@ -262,10 +274,11 @@ trybuild = "1.0"
 tui-logger = { version = "0.18", features = ["tracing-support"] }
 turmoil = "0.7"
 unicode-normalization = "0.1"
-uuid = "1.24"
+uuid = "1.26"
 venndb = "0.6"
 walkdir = "2.5"
 want = "0.3"
+wasmtime = { version = "48.0.1", default-features = false }
 webpki-root-certs = "1.0"
 webpki-roots = "1.0"
 wildcard = "0.3"
@@ -397,9 +410,11 @@ std = [
     "dep:tracing-subscriber",
     "rama-core/std",
     "rama-json/std",
+    "rama-icap?/std",
     "rama-net?/std",
     "rama-utils/std",
 ]
+test-utils = ["rama-net?/test-utils", "rama-udp?/test-utils"]
 compression = [
     "std",
     "http",
@@ -447,15 +462,19 @@ dns-hickory = ["dns", "rama-dns/hickory"]
 tcp = ["std", "net", "dep:rama-tcp"]
 udp = ["std", "net", "dep:rama-udp"]
 ws = ["std", "dep:rama-ws", "http"]
+js = ["std", "dep:rama-js"]
+js-disk-cache = ["js", "rama-js/disk-cache", "rama-pac?/js-disk-cache"]
+pac = ["js", "dns", "http", "dep:rama-pac", "rama-pac/http"]
 acme = ["crypto", "dep:rama-tls-acme", "aws-lc"]
 grpc = ["http", "dep:rama-grpc"]
 grpc-full = ["grpc", "http-full"]
+icap = ["dep:rama-icap"]
 ttrpc = ["dep:rama-ttrpc"]
 http = [
     "std",
     "dep:rama-http",
     "ua",
-    "rama-net?/http",
+    "rama-icap?/http",
     "rama-tls?/http",
     "rama-tls-boring?/ua",
     "rama-tls-boring?/http",
@@ -467,12 +486,7 @@ http = [
 # committing to client, proxy or server specifics: those feature-gate
 # their own extra requirements (e.g. `EasyHttpWebClient` also needs
 # `tcp` + `dns`) on top of this.
-http-backend = [
-    "http",
-    "dep:rama-http-backend",
-    "dep:rama-http-core",
-    "dep:tokio",
-]
+http-backend = ["http", "dep:rama-http-backend", "dep:rama-http-core", "dep:tokio"]
 http-full = [
     "http-backend",
     # `EasyHttpWebClient` (see `http::client`) needs these on top of
@@ -512,46 +526,57 @@ opentelemetry = [
     "rama-grpc?/opentelemetry",
 ]
 # Optional [dial9] runtime-telemetry support across the rama crate
-# family. When enabled on a sub-crate, that crate ships pre-defined
-# `TraceEvent` types and emits them at the corresponding lifecycle
-# hooks; emission is a no-op when the consumer's runtime is not a
-# `dial9-tokio-telemetry::TracedRuntime`.
+# family. Sub-crates either ship predefined `TraceEvent` types or forward
+# support to shared runtime boundaries. Event emission is a no-op when no
+# `dial9` recorder is attached to the consumer's runtime.
 #
-# Enabling this feature requires building with `--cfg tokio_unstable`
-# (workspace-wide via `.cargo/config.toml`, or per-build via
-# `RUSTFLAGS`). Users who DO NOT enable `dial9` do not need
-# `tokio_unstable`.
+# `--cfg tokio_unstable` is optional. Without it dial9 takes poll
+# events from its own spawn helpers, so coverage is the tasks rama
+# routes through `rama_core::rt::Executor` and `rama_core::rt::spawn`.
+# Set it (per-build via `RUSTFLAGS`, or in your `.cargo/config.toml`)
+# to also get every other task on the runtime, task spawn/terminate
+# events and per-worker queue depth.
 #
-# [dial9]: https://github.com/dial9-rs/dial9-tokio-telemetry
+# [dial9]: https://github.com/dial9-rs/dial9
 dial9 = [
     "std",
+    "rama-core/dial9",
+    "rama-http?/dial9",
     "rama-net?/dial9",
     "rama-net-apple-networkextension?/dial9",
     "rama-dns?/dial9",
     "rama-tls-rustls?/dial9",
     "rama-tls-boring?/dial9",
     "rama-socks5?/dial9",
+    "rama-ws?/dial9",
 ]
 
 [dependencies]
 ahash = { workspace = true, optional = true }
 base64 = { workspace = true, optional = true }
-bytes = { workspace = true, optional = true }
+bytes = { workspace = true, features = ["std"], optional = true }
 hex = { workspace = true, optional = true }
 pin-project-lite = { workspace = true, optional = true }
 rama-core = { workspace = true }
 rama-crypto = { workspace = true, optional = true }
 rama-dns = { workspace = true, optional = true }
 rama-fastcgi = { workspace = true, optional = true }
-rama-grpc = { workspace = true, optional = true, features = ["protobuf", "vendor-protoc"] }
+rama-grpc = { workspace = true, optional = true, features = [
+    "protobuf",
+    "vendor-protoc",
+    "json",
+] }
 rama-haproxy = { workspace = true, optional = true }
 rama-http = { workspace = true, optional = true }
 rama-http-backend = { workspace = true, optional = true }
 rama-http-core = { workspace = true, optional = true }
+rama-icap = { workspace = true, optional = true }
+rama-js = { workspace = true, optional = true }
 rama-json = { workspace = true, optional = true }
 rama-net = { workspace = true, optional = true }
 rama-net-apple-networkextension = { workspace = true, optional = true }
 rama-net-apple-xpc = { workspace = true, optional = true }
+rama-pac = { workspace = true, optional = true }
 rama-proxy = { workspace = true, optional = true }
 rama-socks5 = { workspace = true, optional = true }
 rama-tcp = { workspace = true, optional = true }
@@ -583,7 +608,7 @@ rustversion = { workspace = true }
 cc = { workspace = true }
 
 [dev-dependencies]
-bytes = { workspace = true }
+bytes = { workspace = true, features = ["std"] }
 divan = { workspace = true }
 escargot = { workspace = true }
 flate2 = { workspace = true }
@@ -601,6 +626,11 @@ turmoil = { workspace = true }
 
 [lints]
 workspace = true
+
+[[test]]
+name = "http-core"
+path = "tests/http-core/main.rs"
+required-features = ["http-full"]
 
 [profile.dev]
 debug = false
@@ -620,6 +650,31 @@ incremental = false
 [[bench]]
 name = "ua_parse"
 required-features = ["ua"]
+harness = false
+
+[[bench]]
+name = "sse_parser"
+required-features = ["http-full"]
+harness = false
+
+[[bench]]
+name = "graceful_shutdown"
+required-features = ["std"]
+harness = false
+
+[[bench]]
+name = "uri_wire"
+required-features = ["net"]
+harness = false
+
+[[bench]]
+name = "pool_contention"
+required-features = ["net"]
+harness = false
+
+[[bench]]
+name = "rss_parser"
+required-features = ["rss"]
 harness = false
 
 [[bench]]

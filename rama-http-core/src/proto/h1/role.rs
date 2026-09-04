@@ -5,7 +5,7 @@ use rama_core::bytes::BytesMut;
 use rama_core::extensions::Extensions;
 use rama_core::telemetry::tracing::{debug, error, trace, trace_span, warn};
 use rama_http::HeaderName;
-use rama_http::proto::h1::ext::ReasonPhrase;
+use rama_http::proto::h1::ext::{ReasonPhrase, RequestTargetForm};
 use rama_http::proto::{HeaderByteLength, RequestHeaders};
 
 use rama_http_types::header::Entry;
@@ -77,7 +77,10 @@ fn is_complete_fast(bytes: &[u8], prev_len: usize) -> bool {
             if bytes[i + 1..].chunks(3).next() == Some(&b"\n\r\n"[..]) {
                 return true;
             }
-        } else if b == b'\n' && bytes.get(i + 1) == Some(&b'\n') {
+        } else if b == b'\n'
+            && (bytes.get(i + 1) == Some(&b'\n')
+                || bytes[i + 1..].chunks(2).next() == Some(&b"\r\n"[..]))
+        {
             return true;
         }
     }
@@ -184,15 +187,15 @@ impl Http1Transaction for Server {
         };
 
         let slice = buf.split_to(len).freeze();
-        let uri = {
+        let (uri, request_target_form) = {
             let uri_bytes = slice.slice_ref(&slice[path_range]);
             // Zero-copy parse of the request-target. `CONNECT` carries an
             // authority-form target (`host:port`); every other method carries
             // origin-/absolute-/asterisk-form, all handled by `parse`.
-            if method == Method::CONNECT {
-                rama_net::uri::Uri::parse_authority_form(uri_bytes)?
+            let uri = if method == Method::CONNECT {
+                rama_net::uri::Uri::parse_authority_form(uri_bytes.clone())?
             } else {
-                let uri = rama_net::uri::Uri::parse(uri_bytes)?;
+                let uri = rama_net::uri::Uri::parse(uri_bytes.clone())?;
                 // A scheme without an authority (opaque `scheme:path`, e.g.
                 // `htt:p//`) is not a valid HTTP request-target — only origin-,
                 // absolute-, and asterisk-form are.
@@ -200,7 +203,17 @@ impl Http1Transaction for Server {
                     return Err(Parse::Uri);
                 }
                 uri
-            }
+            };
+            let form = if uri_bytes.as_ref() == b"*" {
+                RequestTargetForm::Asterisk
+            } else if method == Method::CONNECT {
+                RequestTargetForm::Authority
+            } else if uri.scheme().is_some() {
+                RequestTargetForm::Absolute
+            } else {
+                RequestTargetForm::Origin
+            };
+            (uri, form)
         };
         subject = RequestLine(method, uri);
 
@@ -231,7 +244,10 @@ impl Http1Transaction for Server {
                     debug!("invalid http1 header: {err:?}");
                 })
                 .map_err(|_e| crate::error::Parse::Internal)?;
-            let value = header_value!(slice.slice(header.value.0..header.value.1));
+            let mut value = header_value!(slice.slice(header.value.0..header.value.1));
+            if name.is_sensitive() {
+                value.set_sensitive(true);
+            }
 
             if name == header::TRANSFER_ENCODING {
                 // RFC 9112 §6.1 / §6.3:
@@ -333,6 +349,7 @@ impl Http1Transaction for Server {
         *ctx.req_method = Some(subject.0.clone());
 
         extensions.insert(HeaderByteLength(len));
+        extensions.insert(request_target_form);
 
         Ok(Some(ParsedMessage {
             head: MessageHead {
@@ -562,11 +579,12 @@ impl Server {
         };
 
         let mut encoder = Encoder::length(0);
-        let mut allowed_trailer_fields: Option<Vec<HeaderName>> = None;
+        let mut allowed_trailer_fields = headers::trailer_header_names(&msg.head.headers);
         let mut wrote_date = false;
         let mut is_name_written = false;
         let mut must_write_chunked = false;
         let mut prev_con_len = None;
+        let connection_header_names = headers::connection_header_names(&msg.head.headers);
 
         macro_rules! handle_is_name_written {
             () => {{
@@ -748,25 +766,6 @@ impl Server {
                         extend(dst, value.as_bytes());
                     }
 
-                    // Parse the Trailer header value into HeaderNames.
-                    // The value may contain comma-separated names.
-                    // HeaderName equality is case-insensitive, while preserving spelling.
-                    if let Ok(value_str) = value.to_str() {
-                        let names: Vec<HeaderName> = value_str
-                            .split(',')
-                            .filter_map(|s| HeaderName::from_bytes(s.trim().as_bytes()).ok())
-                            .collect();
-
-                        match allowed_trailer_fields {
-                            Some(ref mut fields) => {
-                                fields.extend(names);
-                            }
-                            None => {
-                                allowed_trailer_fields = Some(names);
-                            }
-                        }
-                    }
-
                     continue 'headers;
                 }
                 _ => (),
@@ -844,10 +843,12 @@ impl Server {
             extend(dst, b"\r\n");
         }
 
-        if encoder.is_chunked()
-            && let Some(allowed_trailer_fields) = allowed_trailer_fields
-        {
-            encoder = encoder.into_chunked_with_trailing_fields(allowed_trailer_fields);
+        if encoder.is_chunked() {
+            allowed_trailer_fields
+                .retain(|name| !connection_header_names.iter().any(|value| value == name));
+            if !allowed_trailer_fields.is_empty() {
+                encoder = encoder.into_chunked_with_trailing_fields(allowed_trailer_fields);
+            }
         }
 
         Ok(encoder.set_last(is_last))
@@ -962,7 +963,10 @@ impl Http1Transaction for Client {
                         debug!("invalid http1 header: {err:?}");
                     })
                     .map_err(|_e| crate::error::Parse::Internal)?;
-                let value = header_value!(slice.slice(header.value.0..header.value.1));
+                let mut value = header_value!(slice.slice(header.value.0..header.value.1));
+                if name.is_sensitive() {
+                    value.set_sensitive(true);
+                }
 
                 if name == header::CONNECTION {
                     // keep_alive was previously set to default for Version
@@ -1189,6 +1193,7 @@ impl Client {
         // HTTP/1.0 doesn't know about chunked
         let can_chunked = head.version == Version::HTTP_11;
         let headers = &mut head.headers;
+        let connection_header_names = headers::connection_header_names(headers);
 
         // If the user already set specific headers, we should respect them, regardless
         // of what the Body knows about itself. They set them for a reason.
@@ -1271,16 +1276,11 @@ impl Client {
 
         let encoder = encoder.map(|enc| {
             if enc.is_chunked() {
-                // Parse Trailer header values into HeaderNames.
-                // Each Trailer header value may contain comma-separated names.
-                // HeaderName equality is case-insensitive, while preserving spelling.
-                let allowed_trailer_fields: Vec<HeaderName> = headers
-                    .get_all(header::TRAILER)
-                    .iter()
-                    .filter_map(|hv| hv.to_str().ok())
-                    .flat_map(|s| s.split(','))
-                    .filter_map(|s| HeaderName::from_bytes(s.trim().as_bytes()).ok())
-                    .collect();
+                let allowed_trailer_fields: Vec<HeaderName> =
+                    headers::trailer_header_names(headers)
+                        .into_iter()
+                        .filter(|name| !connection_header_names.iter().any(|value| value == name))
+                        .collect();
 
                 if !allowed_trailer_fields.is_empty() {
                     return enc.into_chunked_with_trailing_fields(allowed_trailer_fields);
@@ -1455,12 +1455,7 @@ pub(crate) fn write_headers_title_case(headers: &HeaderMap, dst: &mut Vec<u8>) {
 }
 
 pub(crate) fn write_headers(headers: &HeaderMap, dst: &mut Vec<u8>) {
-    for (name, value) in headers.ordered_iter() {
-        name.write_original(dst);
-        extend(dst, b": ");
-        extend(dst, value.as_bytes());
-        extend(dst, b"\r\n");
-    }
+    rama_http_types::proto::h1::head::encode_header_fields(headers, dst);
 }
 
 fn write_h1_headers(
@@ -1506,7 +1501,7 @@ fn extend(dst: &mut Vec<u8>, data: &[u8]) {
 /// - forward HTTP proxy + insecure scheme -> absolute-form (`http://host/path`)
 /// - otherwise -> origin-form (`/path?query`)
 ///
-/// The `ProxyAddress` extension is the one extra routing signal H1 needs that h2's
+/// The `ProxyRoute` extension is the one extra routing signal H1 needs that h2's
 /// `Pseudo::request` does not (h2 has no absolute-form). The form writers normalise an
 /// empty path to `/` and strip the userinfo/fragment that must not reach the wire.
 fn encode_request_target(
@@ -1516,32 +1511,14 @@ fn encode_request_target(
     dst: &mut Vec<u8>,
 ) {
     let mut buf = BytesMut::new();
-    let written = if *method == Method::CONNECT {
-        uri.write_http_authority_form(&mut buf)
-    } else if uri.is_asterisk() {
-        buf.extend_from_slice(b"*");
-        Ok(())
-    } else {
-        let via_http_proxy = extensions
-            .get_ref::<rama_net::address::ProxyAddress>()
-            .and_then(|proxy| proxy.protocol.as_ref())
-            .map(|protocol| protocol.is_http())
-            .unwrap_or(false);
-        // Same secure/insecure resolution as `req.protocol()` (scheme, inserted
-        // `Protocol`, `Forwarded` client-proto, then a TLS `SecureTransport` marker).
-        let is_insecure =
-            !rama_http_types::protocol_from_uri_or_extensions(extensions, uri).is_secure();
-        if via_http_proxy && is_insecure {
-            uri.write_http_absolute_form(&mut buf)
-        } else {
-            uri.write_http_origin_form(&mut buf)
-        }
-    };
+    let written =
+        rama_http_types::proto::h1::head::encode_request_target(method, uri, extensions, &mut buf);
 
     match written {
         Ok(()) => extend(dst, &buf),
         // defensive: a form mismatch (e.g. authority-form on an URI without authority)
         // falls back to the faithful full form rather than emitting a broken target.
+        Err(_) if uri.is_asterisk() => extend(dst, b"/"),
         Err(_) => uri.encode_to(dst),
     }
 }
@@ -1561,6 +1538,7 @@ mod tests {
     fn encode_request_target_forms() {
         use rama_net::Protocol;
         use rama_net::address::{HostWithPort, ProxyAddress};
+        use rama_net::client::ProxyRoute;
         use rama_net::uri::Uri;
 
         fn target(method: &Method, uri: &str, ext: &Extensions) -> String {
@@ -1571,11 +1549,11 @@ mod tests {
 
         fn http_proxy_ext() -> Extensions {
             let ext = Extensions::new();
-            ext.insert(ProxyAddress {
+            ext.insert(ProxyRoute::Proxy(ProxyAddress {
                 address: HostWithPort::example_domain_http(),
                 credential: None,
                 protocol: Some(Protocol::HTTP),
-            });
+            }));
             ext
         }
 
@@ -1590,6 +1568,9 @@ mod tests {
 
         // OPTIONS * -> "*"
         assert_eq!(target(&Method::OPTIONS, "*", &none), "*");
+        // The infallible connection encoder coerces an invalid GET * to
+        // origin-form instead of putting an invalid target on the wire.
+        assert_eq!(target(&Method::GET, "*", &none), "/");
 
         // CONNECT -> authority-form
         assert_eq!(
@@ -1618,6 +1599,7 @@ mod tests {
     fn encode_request_target_uses_full_protocol_resolution() {
         use rama_net::Protocol;
         use rama_net::address::{HostWithPort, ProxyAddress};
+        use rama_net::client::ProxyRoute;
         use rama_net::uri::Uri;
 
         // A scheme-less request whose protocol is HTTPS *only* via an inserted `Protocol`
@@ -1626,11 +1608,11 @@ mod tests {
         // resolver that `encode_request_target` uses catches it. (The real `SecureTransport`
         // arm — and the feature wiring it needs — is guarded by the `tls` test below.)
         let ext = Extensions::new();
-        ext.insert(ProxyAddress {
+        ext.insert(ProxyRoute::Proxy(ProxyAddress {
             address: HostWithPort::example_domain_http(),
             credential: None,
             protocol: Some(Protocol::HTTP),
-        });
+        }));
         ext.insert(Protocol::HTTPS);
 
         let mut dst = Vec::new();
@@ -1648,15 +1630,16 @@ mod tests {
     fn encode_request_target_honors_real_secure_transport() {
         use rama_net::Protocol;
         use rama_net::address::{HostWithPort, ProxyAddress};
+        use rama_net::client::ProxyRoute;
         use rama_net::uri::Uri;
         use rama_tls::SecureTransport;
 
         let ext = Extensions::new();
-        ext.insert(ProxyAddress {
+        ext.insert(ProxyRoute::Proxy(ProxyAddress {
             address: HostWithPort::example_domain_http(),
             credential: None,
             protocol: Some(Protocol::HTTP),
-        });
+        }));
         ext.insert(SecureTransport::default());
 
         let mut dst = Vec::new();
@@ -1666,7 +1649,9 @@ mod tests {
 
     #[test]
     fn test_parse_request() {
-        let mut raw = BytesMut::from("GET /echo HTTP/1.1\r\nHost: ramaproxy.org\r\n\r\n");
+        let mut raw = BytesMut::from(
+            "GET /echo HTTP/1.1\r\nHost: ramaproxy.org\r\nAuthorization: secret\r\n\r\n",
+        );
         let mut method = None;
         let msg = Server::parse(
             &mut raw,
@@ -1685,14 +1670,45 @@ mod tests {
         assert_eq!(msg.head.subject.0, Method::GET);
         assert_eq!(msg.head.subject.1.as_str(), "/echo");
         assert_eq!(msg.head.version, Version::HTTP_11);
-        assert_eq!(msg.head.headers.len(), 1);
+        assert_eq!(msg.head.headers.len(), 2);
         assert_eq!(msg.head.headers["Host"], "ramaproxy.org");
+        assert!(msg.head.headers["Authorization"].is_sensitive());
         assert_eq!(method, Some(Method::GET));
+        assert_eq!(
+            msg.head.extensions.get_ref::<RequestTargetForm>(),
+            Some(&RequestTargetForm::Origin),
+        );
+    }
+
+    #[test]
+    fn test_parse_request_records_absolute_target_form() {
+        let mut raw =
+            BytesMut::from("GET http://ramaproxy.org/echo HTTP/1.1\r\nHost: ramaproxy.org\r\n\r\n");
+        let msg = Server::parse(
+            &mut raw,
+            ParseContext {
+                req_method: &mut None,
+                h1_parser_config: Default::default(),
+                h1_max_headers: None,
+                h09_responses: false,
+                on_informational: &mut None,
+                prepared_extensions: &mut Some(Extensions::default()),
+            },
+        )
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(msg.head.subject.1.as_str(), "http://ramaproxy.org/echo");
+        assert_eq!(
+            msg.head.extensions.get_ref::<RequestTargetForm>(),
+            Some(&RequestTargetForm::Absolute),
+        );
     }
 
     #[test]
     fn test_parse_response() {
-        let mut raw = BytesMut::from("HTTP/1.1 200 OK\r\nContent-Length: 0\r\n\r\n");
+        let mut raw =
+            BytesMut::from("HTTP/1.1 200 OK\r\nContent-Length: 0\r\nSet-Cookie: secret\r\n\r\n");
         let ctx = ParseContext {
             req_method: &mut Some(Method::GET),
             h1_parser_config: Default::default(),
@@ -1705,8 +1721,9 @@ mod tests {
         assert_eq!(raw.len(), 0);
         assert_eq!(msg.head.subject, StatusCode::OK);
         assert_eq!(msg.head.version, Version::HTTP_11);
-        assert_eq!(msg.head.headers.len(), 1);
+        assert_eq!(msg.head.headers.len(), 2);
         assert_eq!(msg.head.headers["Content-Length"], "0");
+        assert!(msg.head.headers["Set-Cookie"].is_sensitive());
     }
 
     #[test]
@@ -2710,6 +2727,82 @@ mod tests {
     }
 
     #[test]
+    fn connection_nominated_trailers_are_not_encoded() {
+        use crate::proto::BodyLength;
+        use rama_http_types::header::{CONNECTION, HeaderValue, TRAILER};
+
+        fn headers() -> HeaderMap {
+            HeaderMap::from_iter([
+                (CONNECTION, HeaderValue::from_static(" keep-alive,\tX-Hop ")),
+                (TRAILER, HeaderValue::from_static("x-hop")),
+            ])
+        }
+
+        fn trailers() -> HeaderMap {
+            HeaderMap::from_iter([(
+                HeaderName::from_static("x-hop"),
+                HeaderValue::from_static("late"),
+            )])
+        }
+
+        let mut client_head = MessageHead {
+            headers: headers(),
+            ..Default::default()
+        };
+        let mut encoded = Vec::new();
+        let client_encoder = Client::encode(
+            Encode {
+                head: EncodeHead {
+                    version: client_head.version,
+                    subject: client_head.subject,
+                    headers: client_head.headers,
+                    extensions: &mut client_head.extensions,
+                },
+                body: Some(BodyLength::Unknown),
+                keep_alive: true,
+                req_method: &mut None,
+                title_case_headers: false,
+                date_header: false,
+            },
+            &mut encoded,
+        )
+        .unwrap();
+        assert!(
+            client_encoder
+                .encode_trailers::<&[u8]>(trailers(), false)
+                .is_none()
+        );
+
+        let mut server_head = MessageHead {
+            headers: headers(),
+            ..Default::default()
+        };
+        encoded.clear();
+        let server_encoder = Server::encode(
+            Encode {
+                head: EncodeHead {
+                    version: server_head.version,
+                    subject: server_head.subject,
+                    headers: server_head.headers,
+                    extensions: &mut server_head.extensions,
+                },
+                body: Some(BodyLength::Unknown),
+                keep_alive: true,
+                req_method: &mut None,
+                title_case_headers: false,
+                date_header: false,
+            },
+            &mut encoded,
+        )
+        .unwrap();
+        assert!(
+            server_encoder
+                .encode_trailers::<&[u8]>(trailers(), false)
+                .is_none()
+        );
+    }
+
+    #[test]
     fn test_server_encode_connect_method() {
         let mut head = MessageHead::default();
 
@@ -3030,6 +3123,10 @@ mod tests {
         for n in 0..s.len() {
             assert!(is_complete_fast(s, n));
         }
+        let s = b"GET / HTTP/1.1\r\na: b\n\r\n";
+        for n in 0..s.len() {
+            assert!(is_complete_fast(s, n), "{s:?}; {n}");
+        }
 
         // Not
         let s = b"GET / HTTP/1.1\r\na: b\r\n\r";
@@ -3040,6 +3137,32 @@ mod tests {
         for n in 0..s.len() {
             assert!(!is_complete_fast(s, n));
         }
+        let s = b"GET / HTTP/1.1\r\na: b\n\r";
+        for n in 0..s.len() {
+            assert!(!is_complete_fast(s, n));
+        }
+    }
+
+    #[test]
+    fn test_parse_accepts_lf_crlf_terminator() {
+        // The full parser (httparse) accepts a bare-LF line ending followed
+        // by a CRLF blank line as the end of the head, so the partial-read
+        // fast path must recognize it too.
+        let mut bytes = BytesMut::from("GET / HTTP/1.1\r\na: b\n\r\n");
+        let mut prepared_extensions = Some(Extensions::new());
+        Server::parse(
+            &mut bytes,
+            ParseContext {
+                req_method: &mut None,
+                h1_parser_config: Default::default(),
+                h1_max_headers: None,
+                h09_responses: false,
+                on_informational: &mut None,
+                prepared_extensions: &mut prepared_extensions,
+            },
+        )
+        .expect("parse ok")
+        .expect("parse complete");
     }
 
     #[test]

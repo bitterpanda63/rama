@@ -20,6 +20,9 @@ pin_project! {
     /// early drop (e.g. a cancelled/aborted read), when this body is dropped.
     #[must_use = "GuardedBody does nothing unless polled as a response body"]
     pub struct GuardedBody<B, G> {
+        // field order is load-bearing: `inner` drops before `guard`, so a body
+        // wrapper reacting to an early drop (e.g. marking the connection
+        // broken) runs before the guard releases the connection to a pool.
         #[pin]
         inner: B,
         guard: Option<G>,
@@ -72,7 +75,9 @@ where
 mod tests {
     use super::*;
     use crate::body::util::{BodyExt, Empty, Full};
+    use parking_lot::Mutex;
     use rama_core::bytes::Bytes;
+    use std::convert::Infallible;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -119,5 +124,43 @@ mod tests {
             .await
             .unwrap();
         assert!(released.load(Ordering::Relaxed));
+    }
+
+    struct DropOrderBody(Arc<Mutex<Vec<&'static str>>>);
+
+    impl Drop for DropOrderBody {
+        fn drop(&mut self) {
+            self.0.lock().push("body");
+        }
+    }
+
+    impl StreamingBody for DropOrderBody {
+        type Data = Bytes;
+        type Error = Infallible;
+
+        fn poll_frame(
+            self: Pin<&mut Self>,
+            _cx: &mut Context<'_>,
+        ) -> Poll<Option<Result<Frame<Self::Data>, Self::Error>>> {
+            Poll::Pending
+        }
+    }
+
+    struct DropOrderGuard(Arc<Mutex<Vec<&'static str>>>);
+
+    impl Drop for DropOrderGuard {
+        fn drop(&mut self) {
+            self.0.lock().push("guard");
+        }
+    }
+
+    #[test]
+    fn drops_body_before_releasing_guard() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        drop(GuardedBody::new(
+            DropOrderBody(order.clone()),
+            DropOrderGuard(order.clone()),
+        ));
+        assert_eq!(*order.lock(), ["body", "guard"]);
     }
 }

@@ -18,6 +18,11 @@ mod builder;
 #[doc(inline)]
 pub use builder::{DomainBuilder, PushError};
 
+mod pattern;
+pub(crate) use pattern::build_glob;
+#[doc(inline)]
+pub use pattern::{DomainPattern, TryIntoDomainPattern};
+
 // (DomainParseError is defined in this module — see below.)
 
 /// Maximum byte length of a fully-qualified domain name (RFC 1035).
@@ -105,6 +110,24 @@ impl Domain {
         Host::Name(self)
     }
 
+    /// Return the RFC 3986 canonical presentation of this domain.
+    ///
+    /// Domain comparison is already ASCII-case-insensitive; this operation is
+    /// for callers that need a stable lowercase representation for rendering,
+    /// cache keys, or another protocol boundary. An already-lowercase domain
+    /// is returned without allocating.
+    #[must_use]
+    pub fn canonicalize(self) -> Self {
+        if !self.as_str().bytes().any(|byte| byte.is_ascii_uppercase()) {
+            return self;
+        }
+
+        let lower = Bytes::from(self.as_str().to_ascii_lowercase());
+        // Safety: ASCII-lowercasing a valid domain preserves its length,
+        // structure, and allowed byte set.
+        unsafe { Self::from_maybe_borrowed_unchecked(lower) }
+    }
+
     /// Returns `true` if this domain is a Fully Qualified Domain Name.
     #[must_use]
     pub fn is_fqdn(&self) -> bool {
@@ -119,6 +142,16 @@ impl Domain {
     #[must_use]
     pub fn is_wildcard(&self) -> bool {
         self.labels().next().is_some_and(Label::is_wildcard)
+    }
+
+    /// Return this domain without its leading presentation dot.
+    ///
+    /// Returns `None` when no leading dot is present. The returned domain
+    /// shares its backing storage with `self`, so stripping the dot does not
+    /// allocate.
+    #[must_use]
+    pub fn strip_leading_dot(&self) -> Option<Self> {
+        (self.0.first() == Some(&b'.')).then(|| Self(self.0.slice(1..)))
     }
 
     /// Returns `true` if this domain is Top-Level [`Domain`] (TLD).
@@ -408,6 +441,11 @@ pub struct DomainRef<'a> {
 }
 
 impl<'a> DomainRef<'a> {
+    #[must_use]
+    pub(crate) const fn from_validated_bytes(bytes: &'a [u8]) -> Self {
+        Self { bytes }
+    }
+
     /// Returns the raw bytes (always ASCII).
     #[must_use]
     pub fn as_bytes(&self) -> &'a [u8] {
@@ -441,6 +479,12 @@ impl<'a> DomainRef<'a> {
         unsafe { Domain::from_maybe_borrowed_unchecked(bytes) }
     }
 
+    /// Return an owned RFC 3986 canonical presentation of this domain.
+    #[must_use]
+    pub fn canonicalize(self) -> Domain {
+        self.into_owned().canonicalize()
+    }
+
     /// Returns the Unicode (display) form of the domain. See
     /// [`Domain::as_unicode`] for the contract.
     #[cfg(feature = "idna")]
@@ -458,7 +502,25 @@ impl<'a> DomainRef<'a> {
 
 impl<'a> From<&'a Domain> for DomainRef<'a> {
     fn from(d: &'a Domain) -> Self {
-        Self { bytes: &d.0 }
+        Self::from_validated_bytes(&d.0)
+    }
+}
+
+impl<'a> TryFrom<&'a str> for DomainRef<'a> {
+    type Error = DomainParseError;
+
+    fn try_from(name: &'a str) -> Result<Self, Self::Error> {
+        validate_domain_str(name)?;
+        Ok(Self::from_validated_bytes(name.as_bytes()))
+    }
+}
+
+impl<'a> TryFrom<&'a [u8]> for DomainRef<'a> {
+    type Error = DomainParseError;
+
+    fn try_from(name: &'a [u8]) -> Result<Self, Self::Error> {
+        let name = core::str::from_utf8(name).map_err(DomainParseError::non_utf8)?;
+        Self::try_from(name)
     }
 }
 
@@ -1185,6 +1247,18 @@ pub(super) mod seal {
 mod tests {
     use super::*;
 
+    #[test]
+    fn canonicalize_lowercases_the_presentation() {
+        assert_eq!(
+            Domain::from_static("EXAMPLE.Com").canonicalize().as_str(),
+            "example.com"
+        );
+        assert_eq!(
+            Domain::from_static("example.com").canonicalize().as_str(),
+            "example.com"
+        );
+    }
+
     use ahash::{HashMap, HashMapExt as _};
 
     #[test]
@@ -1293,6 +1367,30 @@ mod tests {
             Some(Domain::from_static("foo.example.com")),
             Domain::from_static("*.foo.example.com").as_wildcard_parent()
         );
+    }
+
+    #[test]
+    fn test_domain_strip_leading_dot() {
+        assert!(
+            Domain::from_static("example.com")
+                .strip_leading_dot()
+                .is_none()
+        );
+
+        for (input, expected) in [
+            (".example.com", "example.com"),
+            (".*.example.com", "*.example.com"),
+            (".example.com.", "example.com."),
+        ] {
+            let domain = Domain::from_static(input);
+            let stripped = domain.strip_leading_dot().unwrap();
+            assert_eq!(stripped.as_str(), expected);
+            assert_eq!(
+                stripped.as_str().as_ptr(),
+                domain.as_str().as_ptr().wrapping_add(1),
+                "stripping {input} should share its backing storage",
+            );
+        }
     }
 
     #[test]
@@ -1723,6 +1821,16 @@ mod tests {
         assert!(format!("{err}").contains("UTF-8"), "got: {err}");
         let err = <Domain as TryFrom<&[u8]>>::try_from(bytes.as_slice()).unwrap_err();
         assert!(format!("{err}").contains("UTF-8"), "got: {err}");
+    }
+
+    #[test]
+    fn domain_ref_validates_borrowed_input() {
+        let source = b"EXAMPLE.com";
+        let domain = DomainRef::try_from(source.as_slice()).unwrap();
+        assert_eq!(domain, DomainRef::try_from("example.com").unwrap());
+        assert_eq!(domain.as_bytes().as_ptr(), source.as_ptr());
+        DomainRef::try_from(b"bad..example".as_slice()).unwrap_err();
+        DomainRef::try_from(&[0xff][..]).unwrap_err();
     }
 
     #[test]

@@ -1,0 +1,51 @@
+[package]
+name = "rama-js"
+description = "embedded javascript execution for rama"
+version = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+repository = { workspace = true }
+keywords = ["javascript", "js", "scripting", "rama"]
+categories = ["web-programming", "network-programming"]
+authors = { workspace = true }
+rust-version = { workspace = true }
+
+[package.metadata.cargo-public-api-crates]
+allowed = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+# native C deps can't cross-compile in the docs.rs builder; linux-only docs
+targets = ["x86_64-unknown-linux-gnu"]
+
+[features]
+disk-cache = ["wasmtime/cache"]
+
+[dependencies]
+ahash = { workspace = true }
+flume = { workspace = true }
+parking_lot = { workspace = true }
+rama-core = { workspace = true, features = ["std"] }
+rama-net = { workspace = true, features = ["std"] }
+rama-utils = { workspace = true, features = ["std"] }
+serde = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[target.'cfg(not(target_os = "ios"))'.dependencies]
+wasmtime = { workspace = true, features = ["component-model", "parallel-compilation", "runtime", "std", "winch"] }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+wasmtime = { workspace = true, features = ["component-model", "cranelift", "parallel-compilation", "pulley", "runtime", "std"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = { workspace = true }
+
+[dev-dependencies]
+serde = { workspace = true, features = ["derive"] }
+serde_json = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

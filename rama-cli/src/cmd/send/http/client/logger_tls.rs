@@ -1,10 +1,11 @@
 use rama::{
     Service,
     extensions::ExtensionsRef,
-    net::client::{ConnectorService, EstablishedClientConnection},
+    net::client::{ConnectionError, ConnectorService, EstablishedClientConnection},
+    net::tls::TlsAlpn,
     telemetry::tracing,
     tls::boring::core::x509::X509,
-    tls::{TlsAlpn, client::NegotiatedTlsParameters},
+    tls::client::NegotiatedTlsParameters,
 };
 
 use super::VerboseLogs;
@@ -17,7 +18,7 @@ where
     Input: Send + ExtensionsRef + 'static,
     C: ConnectorService<Input>,
 {
-    type Error = C::Error;
+    type Error = ConnectionError;
     type Output = EstablishedClientConnection<C::Connection, Input>;
 
     async fn serve(&self, input: Input) -> Result<Self::Output, Self::Error> {

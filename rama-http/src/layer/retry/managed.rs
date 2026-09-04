@@ -17,7 +17,12 @@ use rama_utils::backoff::Backoff;
 ///
 /// This requires the [`ManagedPolicy`] to be used.
 ///
+/// Only the caller can set it, i.e. anything _outside_ [`Retry`]: the policy reads it off the
+/// request clone, which references the caller's store, so an insert made by an inner layer lands in
+/// that attempt's own fork and goes unseen here.
+///
 /// [`Extensions`]: rama_core::extensions::Extensions
+/// [`Retry`]: super::Retry
 #[non_exhaustive]
 pub struct DoNotRetry;
 
@@ -363,6 +368,23 @@ mod tests {
 
         // retry should still be the default
         assert_abort(req, Ok(StatusCode::OK.into_response()), &policy).await;
+    }
+
+    #[test]
+    fn custom_clone_result_and_placeholder_display_are_preserved() {
+        let req = Request::builder()
+            .uri("http://example.com/original")
+            .body(RetryBody::empty())
+            .unwrap();
+        let clone = |req: &Request<RetryBody>| {
+            let mut cloned = req.clone();
+            *cloned.uri_mut() = "http://example.com/cloned".try_into().unwrap();
+            Some(cloned)
+        };
+
+        let cloned = CloneInput::clone_input(&clone, &req).unwrap();
+        assert_eq!(cloned.uri().as_str(), "http://example.com/cloned");
+        assert_eq!(Undefined.to_string(), "Undefined");
     }
 
     #[tokio::test]

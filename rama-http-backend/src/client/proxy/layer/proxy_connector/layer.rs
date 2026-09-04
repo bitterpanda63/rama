@@ -1,56 +1,76 @@
-use super::HttpProxyConnector;
+use super::{HttpProxyConnector, HttpProxyVersionPolicy};
 use rama_core::Layer;
 use rama_http::{HeaderMap, HeaderValue, header::IntoHeaderName};
 use rama_http_types::Version;
 use rama_utils::macros::generate_set_and_with;
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 /// A [`Layer`] which wraps the given service with a [`HttpProxyConnector`].
 ///
 /// See [`HttpProxyConnector`] for more information.
 pub struct HttpProxyConnectorLayer {
     required: bool,
-    version: Option<Version>,
+    tls_proxy_supported: bool,
+    version_policy: HttpProxyVersionPolicy,
     headers: Option<HeaderMap>,
 }
 
 impl HttpProxyConnectorLayer {
     /// Create a new [`HttpProxyConnectorLayer`] which creates a [`HttpProxyConnector`]
-    /// which will only connect via an http proxy in case the [`ProxyAddress`] is available
+    /// which will only connect via an HTTP proxy when a proxied [`ProxyRoute`] is available
     /// in the [`Extensions`].
     ///
     /// [`Extensions`]: rama_core::extensions::Extensions
-    /// [`ProxyAddress`]: rama_net::address::ProxyAddress
+    /// [`ProxyRoute`]: rama_net::client::ProxyRoute
     #[must_use]
     pub fn optional() -> Self {
         Self {
             required: false,
-            version: Some(Version::HTTP_11),
+            tls_proxy_supported: true,
+            version_policy: HttpProxyVersionPolicy::Automatic {
+                connect_fallback: Some(Version::HTTP_11),
+            },
             headers: None,
         }
     }
 
     /// Create a new [`HttpProxyConnectorLayer`] which creates a [`HttpProxyConnector`]
-    /// which will always connect via an http proxy, but fail in case the [`ProxyAddress`] is
+    /// which will always connect via an HTTP proxy, but fail when a proxied [`ProxyRoute`] is
     /// not available in the [`Extensions`].
     ///
     /// [`Extensions`]: rama_core::extensions::Extensions
-    /// [`ProxyAddress`]: rama_net::address::ProxyAddress
+    /// [`ProxyRoute`]: rama_net::client::ProxyRoute
     #[must_use]
     pub fn required() -> Self {
         Self {
             required: true,
-            version: Some(Version::HTTP_11),
+            tls_proxy_supported: true,
+            version_policy: HttpProxyVersionPolicy::Automatic {
+                connect_fallback: Some(Version::HTTP_11),
+            },
             headers: None,
         }
     }
 
     generate_set_and_with! {
-        /// Set the HTTP version to use for the CONNECT request.
+        /// Set whether the inner connector supports TLS to an HTTPS proxy.
+        pub fn tls_proxy_support(mut self, supported: bool) -> Self {
+            self.tls_proxy_supported = supported;
+            self
+        }
+    }
+
+    generate_set_and_with! {
+        /// Set the HTTP version used to communicate with the proxy.
         ///
-        /// By default this is set to HTTP/1.1.
+        /// This pins plaintext forward-proxy requests and CONNECT requests to
+        /// the given version, and constrains HTTPS-proxy ALPN accordingly.
+        /// Without an explicit version, plaintext forward-proxy requests follow
+        /// the target version. The `optional` and `required` constructors retain
+        /// HTTP/1.1 as their CONNECT and HTTPS-proxy default; [`Default`] follows
+        /// negotiated HTTPS-proxy ALPN and otherwise falls back to HTTP/1.1.
         pub fn version(mut self, version: Version) -> Self {
-            self.version = Some(version);
+            self.version_policy = HttpProxyVersionPolicy::Fixed(version);
             self
         }
     }
@@ -75,8 +95,22 @@ impl<S> Layer<S> for HttpProxyConnectorLayer {
         HttpProxyConnector {
             inner,
             required: self.required,
-            version: self.version,
+            tls_proxy_supported: self.tls_proxy_supported,
+            version_policy: self.version_policy,
             headers: self.headers.clone(),
+        }
+    }
+}
+
+impl Default for HttpProxyConnectorLayer {
+    fn default() -> Self {
+        Self {
+            required: false,
+            tls_proxy_supported: true,
+            version_policy: HttpProxyVersionPolicy::Automatic {
+                connect_fallback: None,
+            },
+            headers: None,
         }
     }
 }

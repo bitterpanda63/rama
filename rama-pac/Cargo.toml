@@ -1,0 +1,46 @@
+[package]
+name = "rama-pac"
+description = "proxy auto-configuration (PAC) support for rama"
+version = { workspace = true }
+license = { workspace = true }
+edition = { workspace = true }
+repository = { workspace = true }
+keywords = ["pac", "proxy", "javascript", "rama"]
+categories = ["web-programming", "network-programming"]
+authors = { workspace = true }
+rust-version = { workspace = true }
+
+[package.metadata.cargo-public-api-crates]
+allowed = []
+
+[package.metadata.docs.rs]
+all-features = true
+rustdoc-args = ["--cfg", "docsrs"]
+# native C deps can't cross-compile in the docs.rs builder; linux-only docs
+targets = ["x86_64-unknown-linux-gnu"]
+
+[features]
+default = []
+# the http-backed pac script fetcher (`FetchPacScript`)
+http = ["dep:rama-http"]
+js-disk-cache = ["rama-js/disk-cache"]
+
+[dependencies]
+ahash = { workspace = true }
+arc-swap = { workspace = true }
+jiff = { workspace = true }
+parking_lot = { workspace = true }
+rama-core = { workspace = true, features = ["std"] }
+rama-dns = { workspace = true }
+rama-http = { workspace = true, optional = true }
+rama-js = { workspace = true }
+rama-net = { workspace = true, features = ["idna", "std"] }
+rama-utils = { workspace = true, features = ["std"] }
+regex-automata = { workspace = true }
+tokio = { workspace = true, features = ["macros", "rt", "sync", "time"] }
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+
+[lints]
+workspace = true

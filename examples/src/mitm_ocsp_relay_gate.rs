@@ -4,12 +4,12 @@
 //! mirror → issue → staple/replace flow so external clients (`curl`,
 //! `openssl s_client`, `cargo`) can validate the re-signed leaf.
 //!
-//! The whole proxy is assembled from rama building blocks — `UpgradeLayer`
-//! (CONNECT), `IoToProxyBridgeIoLayer` (egress dial + bridge), the TLS
-//! client-hello peek router, `TlsMitmRelay` as a layer, and `IoForwardService`
-//! to bridge the terminated streams. The local upstream is a rama `HttpServer`
-//! behind a `TlsAcceptorLayer`, and the revocation endpoints are a rama
-//! `WebService`.
+//! The whole proxy is assembled from rama building blocks — HTTP CONNECT,
+//! the TLS client-hello peek router, `TlsMitmRelay` as a layer, and
+//! `IoForwardService` to bridge the terminated streams, plus
+//! `IoToProxyBridgeIoLayer` for the local hermetic mode's egress dial. The local
+//! upstream is a rama `HttpServer` behind a `TlsAcceptorLayer`, and the
+//! revocation endpoints are a rama `WebService`.
 //!
 //! `--upstream-revocation` (`ocsp` / `crl` / `none`) sets what the local upstream
 //! cert advertises; `--leaf-revocation` (`staple` default, or `crl` / `ocsp` /
@@ -40,7 +40,7 @@ use std::{
 use base64::Engine as _;
 use rama::{
     Layer,
-    crypto::cert::boring::self_signed_server_auth_gen_ca,
+    crypto::cert::boring::generate_certificate_authority_x509,
     crypto::pki_types::{CertificateDer, PrivatePkcs8KeyDer},
     error::{BoxError, ErrorContext},
     http::{
@@ -48,7 +48,7 @@ use rama::{
         header::{CONNECTION, CONTENT_TYPE},
         layer::{
             trace::TraceLayer,
-            upgrade::{DefaultHttpProxyConnectReplyService, UpgradeLayer},
+            upgrade::{EagerHttpProxyConnector, UpgradeLayer},
         },
         matcher::MethodMatcher,
         server::HttpServer,
@@ -57,7 +57,7 @@ use rama::{
             extract::{Bytes, Path, State},
         },
     },
-    layer::{ConsumeErrLayer, MapOutput},
+    layer::{ConsumeErrLayer, MapOutput, TimeoutLayer},
     net::proxy::{IoForwardOutcome, IoForwardService},
     rt::Executor,
     service::service_fn,
@@ -87,7 +87,10 @@ use rama::{
         },
         server::TlsAcceptorLayer,
     },
-    tls::server::{PeekTlsClientHelloService, SelfSignedData, ServerAuthData, TlsServerConfig},
+    tls::server::{
+        CertificateSubject, PeekTlsClientHelloService, SelfSignedCaConfig, ServerAuthData,
+        TlsServerConfig,
+    },
 };
 use serde::Deserialize;
 
@@ -181,8 +184,11 @@ async fn main() -> Result<(), BoxError> {
     let exec = Executor::default();
 
     // MITM relay with a fresh in-memory CA; export the CA cert for the client.
-    let (ca_crt, ca_key) = self_signed_server_auth_gen_ca(&SelfSignedData {
-        organisation_name: Some("Rama MITM OCSP Gate".to_owned()),
+    let (ca_crt, ca_key) = generate_certificate_authority_x509(&SelfSignedCaConfig {
+        subject: CertificateSubject {
+            organisation_name: Some("Rama MITM OCSP Gate".to_owned()),
+            ..Default::default()
+        },
         ..Default::default()
     })
     .context("gen MITM CA")?;
@@ -244,27 +250,21 @@ async fn main() -> Result<(), BoxError> {
         // MITM it. `--upstream-revocation` is ignored (the real origin's cert is
         // mirrored). No local upstream.
         announce_ready(proxy_addr, &ca_out, revoc_addr)?;
-        let mitm_svc = Arc::new(
-            (
-                ConsumeErrLayer::trace_as_debug(),
-                IoToProxyBridgeIoLayer::extension_connector_target().with_connector(
-                    rama::dns::client::DnsConnector::new(
-                        rama::tcp::client::service::TcpConnector::new(),
-                    ),
+        let mitm_svc =
+            Arc::new(ConsumeErrLayer::trace_as_debug().into_layer(mitm_app(relay, exec.clone())));
+        let connect = EagerHttpProxyConnector::new(
+            TimeoutLayer::new(Duration::from_secs(30)).into_layer(
+                rama::dns::client::DnsConnector::new(
+                    rama::tcp::client::service::TcpConnector::new(),
                 ),
-            )
-                .into_layer(mitm_app(relay, exec.clone())),
+            ),
+            mitm_svc,
         );
         let http_service = HttpServer::auto(exec.clone()).service(Arc::new(
             (
                 TraceLayer::new_for_http(),
                 ConsumeErrLayer::default(),
-                UpgradeLayer::new(
-                    exec.clone(),
-                    MethodMatcher::CONNECT,
-                    DefaultHttpProxyConnectReplyService::new(),
-                    mitm_svc,
-                ),
+                UpgradeLayer::new(exec.clone(), MethodMatcher::CONNECT, connect),
             )
                 .into_layer(service_fn(reject_non_connect)),
         ));

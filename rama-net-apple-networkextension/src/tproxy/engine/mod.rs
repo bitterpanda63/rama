@@ -13,7 +13,7 @@ use rama_core::{
     extensions::ExtensionsRef,
     graceful::{Shutdown, ShutdownGuard},
     io::BridgeIo,
-    rt::Executor,
+    rt::{Executor, OwnedRuntimeHandle},
     service::Service,
 };
 use rama_net::{
@@ -569,7 +569,7 @@ struct TcpSessionPendingData {
     flow_guard: ShutdownGuard,
     /// Runtime handle, used to back the promote handle from `activate`
     /// (which Swift may call from an external, non-Tokio thread).
-    rt_handle: tokio::runtime::Handle,
+    rt_handle: OwnedRuntimeHandle,
     /// Handler-supplied egress options (may be `None` for NW defaults).
     egress_connect_options: Option<NwTcpConnectOptions>,
 }
@@ -689,15 +689,12 @@ impl TransparentProxyTcpSession {
                 TcpDeliverStatus::Accepted
             }
             Err(TrySendError::Full(())) => {
-                // Publish "parked", then RE-CHECK to close a lost-wakeup race:
-                // if the reader drained the channel empty between the
-                // `try_reserve` above and this store, its `paused.swap(false)`
-                // read `false` and skipped the read-demand wake, leaving us
-                // parked until the idle backstop (~15 min). Re-reserving here
-                // recovers it — the channel's own sync makes the freed slot
-                // visible. On success we send (waking the parked reader); if
-                // still full, the buffered items guarantee a future drain whose
-                // `swap(false)` observes our store and fires the demand.
+                // Serialize the publish-and-recheck handshake with the
+                // reader's drain-and-clear handshake. Without the gate, the
+                // reader can free the slot and observe `false` just before this
+                // store, while this re-check still observes the channel as
+                // full; both sides then park with an empty channel.
+                let _pause_gate = self.signals.pause_gate(BridgeDirection::Ingress).lock();
                 self.signals.ingress_paused.store(true, Ordering::Release);
                 match tx.try_reserve() {
                     Ok(permit) => {
@@ -776,8 +773,10 @@ impl TransparentProxyTcpSession {
                 TcpDeliverStatus::Accepted
             }
             Err(TrySendError::Full(())) => {
-                // Re-check after the store to close the lost-wakeup race —
-                // see `try_enqueue_client` for the full rationale.
+                // Symmetric with `try_enqueue_client`: keep the pause
+                // publication and channel re-check atomic with respect to the
+                // matching reader's drain-and-clear handshake.
+                let _pause_gate = self.signals.pause_gate(BridgeDirection::Egress).lock();
                 self.signals.egress_paused.store(true, Ordering::Release);
                 match tx.try_reserve() {
                     Ok(permit) => {
@@ -1156,7 +1155,7 @@ where
 
     // Capture the current runtime handle so `activate` (which Swift may
     // call from an external, non-Tokio thread) can back the promote handle.
-    let rt_handle = tokio::runtime::Handle::current();
+    let rt_handle = OwnedRuntimeHandle::current();
 
     tracing::debug!(protocol = ?meta.protocol, "new tcp session (pending egress connection)");
 
@@ -1166,7 +1165,7 @@ where
     // Spawn through the rama `Executor` (graceful-aware) instead of
     // `flow_guard.spawn_task` directly, so that with the `dial9`
     // feature on the inner `tokio::spawn` is replaced by
-    // `dial9_tokio_telemetry::spawn` — giving per-future wake-event
+    // `dial9::spawn` — giving per-future wake-event
     // tracking on this long-lived per-flow service task.
     let meta_for_close = meta.clone();
     let counters_for_close = byte_counters.clone();
@@ -1209,7 +1208,10 @@ where
         }
     }
 
-    let service_task = Executor::graceful(flow_guard.clone()).spawn_task(async move {
+    // Boxed: the future embeds the whole per-flow service stack, and this
+    // spawn runs on Swift dispatch threads with 512 KiB stacks — moving it
+    // by value through the spawn chain overflows them in debug builds.
+    let service_task = Executor::graceful(flow_guard.clone()).spawn_task(Box::pin(async move {
         let _task_guard = TcpFlowTaskGuard::new();
         let Ok(bridge) = bridge_rx.await else {
             // Cancelled before `activate`. Emit a synthetic close so
@@ -1301,7 +1303,7 @@ where
                 ingress_sent,
             );
         }
-    });
+    }));
 
     let pending = TcpSessionPendingData {
         bridge_tx,
@@ -1689,7 +1691,8 @@ where
     let meta_for_close = meta_arc.clone();
     let flow_guard_for_task = flow_guard.clone();
     let idle_notify_for_task = idle_notify.clone();
-    let service_task = Executor::graceful(flow_guard).spawn_task(async move {
+    // Boxed for the same small-FFI-stack reason as the TCP service task.
+    let service_task = Executor::graceful(flow_guard).spawn_task(Box::pin(async move {
         let Ok(flow) = flow_rx.await else {
             // Cancelled before activate — emit a synthetic close so post-mortem
             // logs still account for the flow.
@@ -1781,7 +1784,7 @@ where
             crate::tproxy::dial9::record_flow_closed(meta_for_close.flow_id, age_ms, 0, 0);
         }
         closed_sink();
-    });
+    }));
 
     let pending = UdpSessionPendingData {
         flow_tx,
@@ -1808,7 +1811,7 @@ where
 /// of whether the calling thread already has a Tokio runtime context.
 ///
 /// FFI entry points are typically invoked from a Swift dispatch queue
-/// (no current Tokio runtime — the bottom `_ => inner.block_on` arm
+/// (no current Tokio runtime — the bottom `_ => block_on_borrowed` arm
 /// runs). This helper also covers the rarer cases where a caller is
 /// already inside *some* runtime (e.g. an integration test, or a
 /// nested FFI invocation): `block_in_place` for multi-thread, an OS
@@ -1828,7 +1831,7 @@ where
 /// caller. The example crate uses its own runtime, kept entirely
 /// separate from the engine's. FFI consumers from Swift / a C bridge
 /// don't have an outer Tokio runtime to begin with, so the typical
-/// case is the bottom `_ => inner.block_on` arm and is safe.
+/// case is the bottom `_ => block_on_borrowed` arm and is safe.
 fn try_block_on_async_task<F>(
     rt: &TransparentProxyAsyncRuntime,
     future: F,
@@ -1836,17 +1839,12 @@ fn try_block_on_async_task<F>(
 where
     F: Future<Output: Send> + Send,
 {
-    // We drive the inner `tokio::runtime::Runtime` directly rather than
-    // the wrapper's `block_on`: non-`'static` futures can't be routed
-    // through dial9's spawn-then-await instrumentation. Wake-tracking
-    // on these short-lived FFI futures is sacrificed; worker-thread
-    // events still fire.
-    //
+    // Poll FFI decisions inline so they can complete even when every runtime
+    // worker is blocked; background work still uses the dial9-aware handle.
     // Callers decide how to handle a panic: flow decisions and app
     // messages convert it to a fail-safe local outcome. (Shutdown no
     // longer blocks on the runtime at all — see `shutdown_blocking` —
     // so a drain-task panic surfaces there as a disconnected channel.)
-    let inner = rt.tokio_runtime();
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         match tokio::runtime::Handle::try_current() {
             Ok(handle)
@@ -1855,7 +1853,7 @@ where
                     tokio::runtime::RuntimeFlavor::MultiThread
                 ) =>
             {
-                tokio::task::block_in_place(|| inner.block_on(future))
+                tokio::task::block_in_place(|| rt.block_on_borrowed(future))
             }
             Ok(handle)
                 if matches!(
@@ -1864,14 +1862,14 @@ where
                 ) =>
             {
                 std::thread::scope(|scope| {
-                    let join = scope.spawn(|| inner.block_on(future));
+                    let join = scope.spawn(|| rt.block_on_borrowed(future));
                     match join.join() {
                         Ok(output) => output,
                         Err(panic) => std::panic::resume_unwind(panic),
                     }
                 })
             }
-            _ => inner.block_on(future),
+            _ => rt.block_on_borrowed(future),
         }
     }))
 }
@@ -2167,15 +2165,20 @@ impl std::fmt::Display for BridgeDirection {
 ///
 /// `*_paused` is set by `on_*_bytes` when the ingress channel is full and
 /// cleared (edge-triggered, firing the read-demand callback) by the matching
-/// stream's `poll_read` on drain. `*_drain` is registered by `poll_write` while
-/// parked on `Paused` and woken by `signal_*_drain`, which also bumps
-/// `*_drain_gen` so the write side can distinguish a fresh pause episode from a
-/// continuously-parked one (see `FfiBridgeStream::poll_write`).
+/// stream's `poll_read` on drain. `*_pause_gate` orders the producer's
+/// publish-and-recheck sequence against the reader's drain-and-clear sequence,
+/// so neither side can observe the other operation half-complete and lose the
+/// demand edge. `*_drain` is registered by `poll_write` while parked on
+/// `Paused` and woken by `signal_*_drain`, which also bumps `*_drain_gen` so the
+/// write side can distinguish a fresh pause episode from a continuously-parked
+/// one (see `FfiBridgeStream::poll_write`).
 pub(crate) struct TcpPerFlowSignals {
     ingress_paused: AtomicBool,
+    ingress_pause_gate: parking_lot::Mutex<()>,
     ingress_drain: AtomicWaker,
     ingress_drain_gen: AtomicU64,
     egress_paused: AtomicBool,
+    egress_pause_gate: parking_lot::Mutex<()>,
     egress_drain: AtomicWaker,
     egress_drain_gen: AtomicU64,
 }
@@ -2184,9 +2187,11 @@ impl TcpPerFlowSignals {
     pub(crate) fn new() -> Self {
         Self {
             ingress_paused: AtomicBool::new(false),
+            ingress_pause_gate: parking_lot::Mutex::new(()),
             ingress_drain: AtomicWaker::new(),
             ingress_drain_gen: AtomicU64::new(0),
             egress_paused: AtomicBool::new(false),
+            egress_pause_gate: parking_lot::Mutex::new(()),
             egress_drain: AtomicWaker::new(),
             egress_drain_gen: AtomicU64::new(0),
         }
@@ -2196,6 +2201,13 @@ impl TcpPerFlowSignals {
         match dir {
             BridgeDirection::Ingress => &self.ingress_paused,
             BridgeDirection::Egress => &self.egress_paused,
+        }
+    }
+
+    fn pause_gate(&self, dir: BridgeDirection) -> &parking_lot::Mutex<()> {
+        match dir {
+            BridgeDirection::Ingress => &self.ingress_pause_gate,
+            BridgeDirection::Egress => &self.egress_pause_gate,
         }
     }
 

@@ -8,12 +8,16 @@ mod serve_fp;
 mod serve_fs;
 #[cfg(feature = "boring")]
 mod serve_http_test;
+#[cfg(all(feature = "icap", feature = "tcp"))]
+mod serve_icap;
 mod serve_ip;
 mod serve_proxy;
 mod serve_stunnel;
 
+mod pac;
 mod probe;
 mod resolve;
+mod send_data;
 mod send_feed;
 mod send_file;
 mod send_json;

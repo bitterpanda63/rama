@@ -1,5 +1,9 @@
 pub use socket2 as core;
 
+mod as_socket_ref;
+#[doc(inline)]
+pub use as_socket_ref::AsSocketRef;
+
 #[cfg(any(target_os = "android", target_os = "fuchsia", target_os = "linux"))]
 mod device_name;
 
@@ -10,6 +14,13 @@ mod device_name;
 )]
 #[doc(inline)]
 pub use device_name::DeviceName;
+
+mod interfaces;
+#[doc(inline)]
+pub use interfaces::{
+    HardwareAddress, Interface, InterfaceAddress, InterfaceFlags, interfaces, local_addresses,
+    route_source_address,
+};
 
 pub mod opts;
 #[doc(inline)]

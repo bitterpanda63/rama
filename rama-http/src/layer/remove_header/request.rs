@@ -45,7 +45,10 @@ pub struct RemoveRequestHeaderLayer {
 enum RemoveRequestHeaderMode {
     Prefix(SmolStr),
     Exact(HeaderName),
-    Hop,
+    HopContextAware,
+    HopStrict,
+    ProxyAuth,
+    ForwardingMetadata,
     Sensitive,
 }
 
@@ -70,11 +73,43 @@ impl RemoveRequestHeaderLayer {
 
     /// Create a new [`RemoveRequestHeaderLayer`].
     ///
-    /// Removes all hop-by-hop request headers as specified in [RFC 9110](https://github.com/plabayo/rama/blob/main/rama-http-core/specifications/rfc9110.txt#section-7.6.1).
+    /// Removes hop-by-hop request headers while preserving valid metadata that
+    /// has to be originated for the next hop.
+    ///
+    /// This is the recommended mode for HTTP intermediaries. Use
+    /// [`Self::hop_by_hop_strict`] to remove the upgrade envelope as well.
     #[must_use]
     pub fn hop_by_hop() -> Self {
         Self {
-            mode: RemoveRequestHeaderMode::Hop,
+            mode: RemoveRequestHeaderMode::HopContextAware,
+        }
+    }
+
+    /// Removes request-side hop-by-hop fields without forwarding upgrade or
+    /// trailer capabilities to the next hop.
+    #[must_use]
+    pub fn hop_by_hop_strict() -> Self {
+        Self {
+            mode: RemoveRequestHeaderMode::HopStrict,
+        }
+    }
+
+    /// Remove credentials addressed to the current proxy.
+    #[must_use]
+    pub fn proxy_auth() -> Self {
+        Self {
+            mode: RemoveRequestHeaderMode::ProxyAuth,
+        }
+    }
+
+    /// Create a new [`RemoveRequestHeaderLayer`].
+    ///
+    /// Removes headers that describe the forwarding chain or client address using
+    /// [`remove_forwarding_metadata_request_headers`](super::remove_forwarding_metadata_request_headers).
+    #[must_use]
+    pub fn forwarding_metadata() -> Self {
+        Self {
+            mode: RemoveRequestHeaderMode::ForwardingMetadata,
         }
     }
 
@@ -131,9 +166,29 @@ impl<S> RemoveRequestHeader<S> {
 
     /// Create a new [`RemoveRequestHeader`].
     ///
-    /// Removes all hop-by-hop request headers as specified in [RFC 9110](https://github.com/plabayo/rama/blob/main/rama-http-core/specifications/rfc9110.txt#section-7.6.1).
+    /// Removes hop-by-hop request headers while preserving valid metadata that
+    /// has to be originated for the next hop.
     pub fn hop_by_hop(inner: S) -> Self {
         RemoveRequestHeaderLayer::hop_by_hop().into_layer(inner)
+    }
+
+    /// Removes request-side hop-by-hop fields without forwarding upgrade or
+    /// trailer capabilities to the next hop.
+    pub fn hop_by_hop_strict(inner: S) -> Self {
+        RemoveRequestHeaderLayer::hop_by_hop_strict().into_layer(inner)
+    }
+
+    /// Remove credentials addressed to the current proxy.
+    pub fn proxy_auth(inner: S) -> Self {
+        RemoveRequestHeaderLayer::proxy_auth().into_layer(inner)
+    }
+
+    /// Create a new [`RemoveRequestHeader`].
+    ///
+    /// Removes headers that describe the forwarding chain or client address using
+    /// [`remove_forwarding_metadata_request_headers`](super::remove_forwarding_metadata_request_headers).
+    pub fn forwarding_metadata(inner: S) -> Self {
+        RemoveRequestHeaderLayer::forwarding_metadata().into_layer(inner)
     }
 
     /// Create a new [`RemoveRequestHeader`].
@@ -160,8 +215,17 @@ where
         mut req: Request<ReqBody>,
     ) -> impl Future<Output = Result<Self::Output, Self::Error>> + Send + '_ {
         match &self.mode {
-            RemoveRequestHeaderMode::Hop => {
+            RemoveRequestHeaderMode::HopContextAware => {
+                drop(super::sanitize_hop_by_hop_request_headers(&mut req));
+            }
+            RemoveRequestHeaderMode::HopStrict => {
                 super::remove_hop_by_hop_request_headers(req.headers_mut())
+            }
+            RemoveRequestHeaderMode::ProxyAuth => {
+                super::remove_proxy_auth_request_headers(req.headers_mut())
+            }
+            RemoveRequestHeaderMode::ForwardingMetadata => {
+                super::remove_forwarding_metadata_request_headers(req.headers_mut())
             }
             RemoveRequestHeaderMode::Sensitive => {
                 super::remove_sensitive_request_headers(req.headers_mut())
@@ -251,6 +315,7 @@ mod test {
                 assert!(req.headers().get("x-foo").is_none());
                 assert!(req.headers().get("x-bar").is_none());
                 assert!(req.headers().get("connection").is_none());
+                assert_eq!(req.headers().get("x-real-ip").unwrap(), "1.2.3.4");
                 assert_eq!(
                     req.headers().get("foo").map(|v| v.to_str().unwrap()),
                     Some("bar")
@@ -262,6 +327,64 @@ mod test {
             .header("x-foo", "1")
             .header("x-real-ip", "1.2.3.4")
             .header("foo", "bar")
+            .body(Body::empty())
+            .unwrap();
+        _ = svc.serve(req).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_request_header_hop_by_hop_preserves_valid_upgrade() {
+        let svc =
+            RemoveRequestHeaderLayer::hop_by_hop().into_layer(service_fn(async |req: Request| {
+                assert_eq!(req.headers()["connection"], "upgrade");
+                assert_eq!(req.headers()["upgrade"], "websocket");
+                assert!(req.headers().get("keep-alive").is_none());
+                assert!(req.headers().get("x-hop").is_none());
+                Ok::<_, Infallible>(Response::new(Body::empty()))
+            }));
+        let req = Request::builder()
+            .version(crate::Version::HTTP_11)
+            .header("connection", "keep-alive, upgrade, x-hop")
+            .header("upgrade", "websocket")
+            .header("keep-alive", "timeout=5")
+            .header("x-hop", "secret")
+            .body(Body::empty())
+            .unwrap();
+        _ = svc.serve(req).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_request_header_hop_by_hop_strict_removes_upgrade() {
+        let svc = RemoveRequestHeaderLayer::hop_by_hop_strict().into_layer(service_fn(
+            async |req: Request| {
+                assert!(req.headers().get("connection").is_none());
+                assert!(req.headers().get("upgrade").is_none());
+                Ok::<_, Infallible>(Response::new(Body::empty()))
+            },
+        ));
+        let req = Request::builder()
+            .version(crate::Version::HTTP_11)
+            .header("connection", "upgrade")
+            .header("upgrade", "websocket")
+            .body(Body::empty())
+            .unwrap();
+        _ = svc.serve(req).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn remove_request_header_forwarding_metadata() {
+        let svc = RemoveRequestHeaderLayer::forwarding_metadata().into_layer(service_fn(
+            async |req: Request| {
+                assert!(req.headers().get("x-forwarded-for").is_none());
+                assert!(req.headers().get("x-real-ip").is_none());
+                assert_eq!(req.headers().get("connection").unwrap(), "close");
+                Ok::<_, Infallible>(Response::new(Body::empty()))
+            },
+        ));
+        let req = Request::builder()
+            .header("x-forwarded-for", "1.2.3.4")
+            .header("x-real-ip", "1.2.3.4")
+            .header("connection", "close")
             .body(Body::empty())
             .unwrap();
         _ = svc.serve(req).await.unwrap();

@@ -13,6 +13,7 @@ use rama::{
     net::{
         Protocol,
         address::{ProxyAddress, SocketAddress},
+        client::ProxyRoute,
         user::{Basic, ProxyCredential},
     },
     rt::Executor,
@@ -21,7 +22,7 @@ use rama::{
     tls::boring::server::TlsAcceptorService,
     tls::{
         client::{ServerVerifyMode, TlsClientConfig},
-        server::{SelfSignedData, TlsServerConfig},
+        server::{GeneratedServerAuthConfig, TlsServerConfig},
     },
     utils::str::non_empty_str,
 };
@@ -51,7 +52,9 @@ async fn test_http_https_socks5_and_socks5h_connect_proxy() {
         // test regular proxy flow
         let result = runner
             .get(uri)
-            .extension(ProxyAddress::try_from("http://tom:clancy@127.0.0.1:62029").unwrap())
+            .extension(ProxyRoute::Proxy(
+                ProxyAddress::try_from("http://tom:clancy@127.0.0.1:62029").unwrap(),
+            ))
             .send()
             .await
             .unwrap()
@@ -66,7 +69,9 @@ async fn test_http_https_socks5_and_socks5h_connect_proxy() {
         // test regular proxy flow
         let result = runner
             .get(uri)
-            .extension(ProxyAddress::try_from("https://tom:clancy@127.0.0.1:62029").unwrap())
+            .extension(ProxyRoute::Proxy(
+                ProxyAddress::try_from("https://tom:clancy@127.0.0.1:62029").unwrap(),
+            ))
             .send()
             .await
             .unwrap()
@@ -104,6 +109,7 @@ async fn test_http_client_over_socks5_proxy_connect(
         .with_proxy_support()
         .with_tls_support_using_boringssl(tls_config)
         .with_default_http_connector(Executor::default())
+        .without_connection_pool()
         .build_client();
 
     let test_uris = [
@@ -121,14 +127,14 @@ async fn test_http_client_over_socks5_proxy_connect(
             .body(Body::empty())
             .expect("build simple GET request");
 
-        request.extensions().insert(ProxyAddress {
+        request.extensions().insert(ProxyRoute::Proxy(ProxyAddress {
             protocol: Some(Protocol::SOCKS5),
             address: proxy_socket_addr.into(),
             credential: Some(ProxyCredential::Basic(Basic::new(
                 non_empty_str!("john"),
                 non_empty_str!("secret"),
             ))),
-        });
+        }));
 
         tracing::info!(
             url.full = %uri,
@@ -151,7 +157,7 @@ async fn test_http_client_over_socks5_proxy_connect(
 
 async fn spawn_http_server() -> SocketAddress {
     let tcp_service =
-        TcpListener::bind_address(SocketAddress::default_ipv4(63179), Executor::default())
+        TcpListener::bind_address(SocketAddress::local_ipv4(63179), Executor::default())
             .await
             .expect("bind HTTP server on open port");
 
@@ -171,7 +177,7 @@ async fn spawn_http_server() -> SocketAddress {
 
 async fn spawn_https_server() -> SocketAddress {
     let tcp_service =
-        TcpListener::bind_address(SocketAddress::default_ipv4(63181), Executor::default())
+        TcpListener::bind_address(SocketAddress::local_ipv4(63181), Executor::default())
             .await
             .expect("bind HTTP server on open port");
 
@@ -185,10 +191,7 @@ async fn spawn_https_server() -> SocketAddress {
         .service((ArcLayer::new(), ErrorHandlerLayer::new()).into_layer(app));
 
     let config = TlsServerConfig::new()
-        .try_with_self_signed(SelfSignedData {
-            organisation_name: Some("Socks5 Https Test Server".to_owned()),
-            ..Default::default()
-        })
+        .try_with_generated_server_auth(GeneratedServerAuthConfig::default())
         .expect("self-signed")
         .with_alpn_http_auto();
     let https_server = TlsAcceptorService::new(config, http_server, false);

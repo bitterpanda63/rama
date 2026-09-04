@@ -7,7 +7,7 @@ use rama_core::bytes::{
     {Buf, Bytes},
 };
 use rama_core::telemetry::tracing::{debug, trace};
-use rama_http_types::{HeaderMap, HeaderName, header::StandardHeader};
+use rama_http_types::{HeaderMap, HeaderName};
 
 use super::io::WriteBuf;
 use super::role::{write_headers, write_headers_title_case};
@@ -120,7 +120,7 @@ impl Encoder {
         let len = msg.remaining();
         debug_assert!(len > 0, "encode() called with empty buf");
 
-        let kind = match self.kind {
+        let kind = match &mut self.kind {
             Kind::Chunked(_) => {
                 trace!("encoding chunked {}B", len);
                 let buf = ChunkSize::new(len)
@@ -128,7 +128,7 @@ impl Encoder {
                     .chain(b"\r\n" as &'static [u8]);
                 BufKind::Chunked(buf)
             }
-            Kind::Length(ref mut remaining) => {
+            Kind::Length(remaining) => {
                 trace!("sized write, len = {}", len);
                 if len as u64 > *remaining {
                     let limit = *remaining as usize;
@@ -170,7 +170,7 @@ impl Encoder {
                     };
 
                     if allowed_set.contains(name) {
-                        if is_valid_trailer_field(name) {
+                        if name.is_allowed_in_trailers() {
                             allowed_trailers.append(name, value);
                         } else {
                             debug!("trailer field is not valid: {}", &name);
@@ -250,71 +250,51 @@ impl Encoder {
     }
 }
 
-pub(super) fn is_valid_trailer_field(name: &HeaderName) -> bool {
-    !matches!(
-        name.standard(),
-        Some(
-            StandardHeader::Authorization
-                | StandardHeader::CacheControl
-                | StandardHeader::ContentEncoding
-                | StandardHeader::ContentLength
-                | StandardHeader::ContentRange
-                | StandardHeader::ContentType
-                | StandardHeader::Host
-                | StandardHeader::MaxForwards
-                | StandardHeader::SetCookie
-                | StandardHeader::Trailer
-                | StandardHeader::TransferEncoding
-                | StandardHeader::Te
-        )
-    )
-}
-
 impl<B> Buf for EncodedBuf<B>
 where
     B: Buf,
 {
     #[inline]
     fn remaining(&self) -> usize {
-        match self.kind {
-            BufKind::Exact(ref b) => b.remaining(),
-            BufKind::Limited(ref b) => b.remaining(),
-            BufKind::Chunked(ref b) => b.remaining(),
-            BufKind::ChunkedEnd(ref b) => b.remaining(),
-            BufKind::Trailers(ref b) => b.remaining(),
+        match &self.kind {
+            BufKind::Exact(b) => b.remaining(),
+            BufKind::Limited(b) => b.remaining(),
+            BufKind::Chunked(b) => b.remaining(),
+            BufKind::ChunkedEnd(b) => b.remaining(),
+            BufKind::Trailers(b) => b.remaining(),
         }
     }
 
     #[inline]
     fn chunk(&self) -> &[u8] {
-        match self.kind {
-            BufKind::Exact(ref b) => b.chunk(),
-            BufKind::Limited(ref b) => b.chunk(),
-            BufKind::Chunked(ref b) => b.chunk(),
-            BufKind::ChunkedEnd(ref b) => b.chunk(),
-            BufKind::Trailers(ref b) => b.chunk(),
+        match &self.kind {
+            BufKind::Exact(b) => b.chunk(),
+            BufKind::Limited(b) => b.chunk(),
+            BufKind::Chunked(b) => b.chunk(),
+            BufKind::ChunkedEnd(b) => b.chunk(),
+            BufKind::Trailers(b) => b.chunk(),
         }
     }
 
     #[inline]
     fn advance(&mut self, cnt: usize) {
-        match self.kind {
-            BufKind::Exact(ref mut b) => b.advance(cnt),
-            BufKind::Limited(ref mut b) => b.advance(cnt),
-            BufKind::Chunked(ref mut b) => b.advance(cnt),
-            BufKind::ChunkedEnd(ref mut b) => b.advance(cnt),
-            BufKind::Trailers(ref mut b) => b.advance(cnt),
+        match &mut self.kind {
+            BufKind::Exact(b) => b.advance(cnt),
+            BufKind::Limited(b) => b.advance(cnt),
+            BufKind::Chunked(b) => b.advance(cnt),
+            BufKind::ChunkedEnd(b) => b.advance(cnt),
+            BufKind::Trailers(b) => b.advance(cnt),
         }
     }
 
     #[inline]
     fn chunks_vectored<'t>(&'t self, dst: &mut [IoSlice<'t>]) -> usize {
-        match self.kind {
-            BufKind::Exact(ref b) => b.chunks_vectored(dst),
-            BufKind::Limited(ref b) => b.chunks_vectored(dst),
-            BufKind::Chunked(ref b) => b.chunks_vectored(dst),
-            BufKind::ChunkedEnd(ref b) => b.chunks_vectored(dst),
-            BufKind::Trailers(ref b) => b.chunks_vectored(dst),
+        match &self.kind {
+            BufKind::Exact(b) => b.chunks_vectored(dst),
+            BufKind::Limited(b) => b.chunks_vectored(dst),
+            BufKind::Chunked(b) => b.chunks_vectored(dst),
+            BufKind::ChunkedEnd(b) => b.chunks_vectored(dst),
+            BufKind::Trailers(b) => b.chunks_vectored(dst),
         }
     }
 }
@@ -426,8 +406,9 @@ mod tests {
     use rama_http_types::{
         HeaderMap, HeaderName, HeaderValue,
         header::{
-            AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH, CONTENT_RANGE,
-            CONTENT_TYPE, HOST, MAX_FORWARDS, SET_COOKIE, TE, TRAILER, TRANSFER_ENCODING,
+            ACCEPT_RANGES, AUTHORIZATION, CACHE_CONTROL, CONTENT_ENCODING, CONTENT_LENGTH,
+            CONTENT_RANGE, CONTENT_TYPE, ETAG, HOST, MAX_FORWARDS, SET_COOKIE, TE, TRAILER,
+            TRANSFER_ENCODING,
         },
     };
 
@@ -641,6 +622,24 @@ mod tests {
         headers.insert(TE, HeaderValue::from_static("header data"));
 
         assert!(encoder.encode_trailers::<&[u8]>(headers, true).is_none());
+    }
+
+    #[test]
+    fn chunked_with_standard_trailers() {
+        let encoder =
+            Encoder::chunked().into_chunked_with_trailing_fields(vec![ACCEPT_RANGES, ETAG]);
+        let headers = HeaderMap::from_iter([
+            (ACCEPT_RANGES, HeaderValue::from_static("bytes")),
+            (ETAG, HeaderValue::from_static("\"generated-after-body\"")),
+        ]);
+
+        let encoded = encoder.encode_trailers::<&[u8]>(headers, false).unwrap();
+        let mut dst = Vec::new();
+        dst.put(encoded);
+        assert_eq!(
+            dst,
+            b"0\r\naccept-ranges: bytes\r\netag: \"generated-after-body\"\r\n\r\n"
+        );
     }
 
     #[test]

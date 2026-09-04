@@ -3,7 +3,9 @@
 mod config;
 #[doc(inline)]
 pub use config::{
-    ClientVerifyMode, DynamicCertIssuer, SelfSignedData, SelfSignedKeyKind, ServerAuthData,
+    CertificateAuthorityData, CertificateIdentity, CertificateIssuanceContext, CertificateKeyKind,
+    CertificateSubject, CertificateValidity, ClientVerifyMode, DynamicCertIssuer,
+    GeneratedServerAuthConfig, LeafCertConfig, LeafCertRequest, SelfSignedCaConfig, ServerAuthData,
     TlsClientVerify, TlsServerAuth, TlsServerConfig, TlsStoreClientCertChain,
 };
 
@@ -15,7 +17,7 @@ mod peek_client_hello;
 #[doc(inline)]
 pub use peek_client_hello::{
     InputWithClientHello, PeekTlsClientHelloService, TlsClientHelloPrefixedIo,
-    peek_client_hello_from_input,
+    peek_client_hello_from_input, peek_client_hello_from_input_with_timeout_policy,
 };
 
 mod sni;

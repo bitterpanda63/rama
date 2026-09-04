@@ -44,12 +44,16 @@ Here is a list of all `rama` crates:
 - [`rama-proxy`](https://crates.io/crates/rama-proxy): proxy types and utilities for rama
 - [`rama-socks5`](https://crates.io/crates/rama-socks5): SOCKS5 support for rama
 - [`rama-haproxy`](https://crates.io/crates/rama-haproxy): rama HaProxy support
+- [`rama-icap`](https://crates.io/crates/rama-icap): ICAP support for rama
 - [`rama-ua`](https://crates.io/crates/rama-ua): User-Agent (UA) support for `rama`
 - [`rama-http-types`](https://crates.io/crates/rama-http-types): http types and utilities
 - [`rama-http-headers`](https://crates.io/crates/rama-http-headers): typed http headers
 - [`rama-json`](https://crates.io/crates/rama-json): streaming JSON tokenizer, JSONPath selection, and rewriting utilities
+- [`rama-js`](https://crates.io/crates/rama-js): embedded javascript execution
+- [`rama-pac`](https://crates.io/crates/rama-pac): proxy auto-configuration (PAC) support
 - [`rama-grpc`](https://crates.io/crates/rama-grpc): Grpc support for rama
 - [`rama-grpc-build`](https://crates.io/crates/rama-grpc-build): Grpc codegen support for rama
+- [`rama-grpc-macros`](https://crates.io/crates/rama-grpc-macros): proc-macros to define gRPC services inline, without a `.proto` file
 - [`rama-http`](https://crates.io/crates/rama-http): rama http services, layers and utilities
 - [`rama-http-macros`](https://crates.io/crates/rama-http-macros): proc-macros powering the type-safe HTML templating in `rama-http::protocols::html`
 - [`rama-http-backend`](https://crates.io/crates/rama-http-backend): default http backend for `rama`
@@ -112,6 +116,14 @@ Most organisations running rama in production do so on a variety of Linux system
 | MacOS    | ✅     | developer machine (arm64) + [GitHub Action](https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners) (arm64 and intel) |
 | Linux    | ✅     | AMD x64 developer machine with Ubuntu 25 + [GitHub Action (Ubuntu 24.04)](https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners) (arm64 and amd64) |
 | Windows  | ✅     | Windows 11 AMD x64 developer machine + [GitHub Action](https://docs.github.com/en/actions/using-github-hosted-runners/about-github-hosted-runners/about-github-hosted-runners) (arm64 and amd64) |
+
+GNU/Linux binaries can also be cross-compiled from macOS and Windows using
+[`cargo-zigbuild`](https://github.com/rust-cross/cargo-zigbuild). This is tested
+in CI for `x86_64-unknown-linux-gnu` with Rama's native system DNS resolver and
+native TLS backends enabled. Cross-built binaries must be run on a compatible
+Linux system, not on the macOS or Windows build host.
+On Windows, install the `x86_64-pc-windows-gnu` variant of the Rust toolchain
+selected by `rust-toolchain.toml`; the `just` recipes select it automatically.
 
 ### Tier 2 Platforms
 

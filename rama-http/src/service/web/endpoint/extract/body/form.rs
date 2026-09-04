@@ -2,7 +2,7 @@ use rama_core::bytes::Bytes;
 
 use super::BytesRejection;
 use crate::body::util::BodyExt;
-use crate::service::web::extract::FromRequest;
+use crate::service::web::extract::{FromRequest, FromRequestBody};
 use crate::utils::macros::{composite_http_rejection, define_http_rejection};
 use crate::{Method, Request};
 
@@ -44,34 +44,68 @@ where
     type Rejection = FormRejection;
 
     async fn from_request(req: Request) -> Result<Self, Self::Rejection> {
-        // Extracted into separate fn so it's only compiled once for all T.
-        async fn extract_form_body_bytes(req: Request) -> Result<Bytes, FormRejection> {
-            if !crate::service::web::extract::has_any_content_type(
-                req.headers(),
-                &[&crate::mime::APPLICATION_WWW_FORM_URLENCODED],
-            ) {
-                return Err(InvalidFormContentType.into());
+        let (parts, body) = req.into_parts();
+        let future = Self::from_request_body(&parts, body);
+        future.await
+    }
+}
+
+impl<T> FromRequestBody for Form<T>
+where
+    T: serde::de::DeserializeOwned + Send + Sync + 'static,
+{
+    fn from_request_body(
+        parts: &crate::request::Parts,
+        body: crate::Body,
+    ) -> impl Future<Output = Result<Self, Self::Rejection>> + Send + 'static {
+        let query_result: Option<Result<Self, FormRejection>> =
+            if matches!(parts.method, Method::GET | Method::HEAD) {
+                Some(
+                    parts
+                        .uri
+                        .query_params()
+                        .map(Self)
+                        .map_err(|err| FailedToDeserializeForm::from_err(err).into()),
+                )
+            } else {
+                None
+            };
+        let body_bytes = extract_form_body_bytes(parts, body);
+
+        async move {
+            if let Some(result) = query_result {
+                return result;
             }
 
-            let body = req.into_body();
-            let bytes = body.collect().await.map_err(BytesRejection::from_err)?;
-
-            Ok(bytes.to_bytes())
-        }
-
-        if req.method() == Method::GET {
-            let value = match req.uri().query_params() {
-                Ok(value) => value,
-                Err(err) => return Err(FailedToDeserializeForm::from_err(err).into()),
-            };
-            Ok(Self(value))
-        } else {
-            let b = extract_form_body_bytes(req).await?;
-            Ok(Self(match serde_html_form::from_bytes(&b) {
+            let bytes = body_bytes.await?;
+            Ok(Self(match serde_html_form::from_bytes(&bytes) {
                 Ok(value) => value,
                 Err(err) => return Err(FailedToDeserializeForm::from_err(err).into()),
             }))
         }
+    }
+}
+
+// Kept non-generic so body collection is compiled once rather than once per form type.
+fn extract_form_body_bytes(
+    parts: &crate::request::Parts,
+    body: crate::Body,
+) -> impl Future<Output = Result<Bytes, FormRejection>> + Send + 'static {
+    let has_valid_content_type = crate::service::web::extract::has_any_content_type(
+        &parts.headers,
+        &[&crate::mime::APPLICATION_WWW_FORM_URLENCODED],
+    );
+
+    async move {
+        if !has_valid_content_type {
+            return Err(InvalidFormContentType.into());
+        }
+
+        body.collect()
+            .await
+            .map_err(BytesRejection::from_err)
+            .map(|body| body.to_bytes())
+            .map_err(Into::into)
     }
 }
 
@@ -186,6 +220,49 @@ mod test {
         let req = Request::builder()
             .uri("/?name=Devan")
             .method(Method::GET)
+            .body(Body::empty())
+            .unwrap();
+        let resp = service.serve(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn test_form_head_uses_query() {
+        #[derive(Debug, serde::Deserialize)]
+        struct Input {
+            name: String,
+            age: u8,
+        }
+
+        let service = WebService::default().with_head("/", async |Form(input): Form<Input>| {
+            assert_eq!(input.name, "Devan");
+            assert_eq!(input.age, 29);
+        });
+
+        let req = Request::builder()
+            .uri("/?name=Devan&age=29")
+            .method(Method::HEAD)
+            .body(Body::empty())
+            .unwrap();
+        let resp = service.serve(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn test_form_head_missing_query_data_fails() {
+        #[derive(Debug, serde::Deserialize)]
+        #[expect(dead_code)]
+        struct Input {
+            name: String,
+            age: u8,
+        }
+
+        let service =
+            WebService::default().with_head("/", async |Form(_): Form<Input>| StatusCode::OK);
+
+        let req = Request::builder()
+            .uri("/?name=Devan")
+            .method(Method::HEAD)
             .body(Body::empty())
             .unwrap();
         let resp = service.serve(req).await.unwrap();

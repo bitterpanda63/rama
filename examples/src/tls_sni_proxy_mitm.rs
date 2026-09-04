@@ -95,7 +95,9 @@ use rama::{
         client::EasyHttpWebClient,
         layer::{
             map_response_body::MapResponseBodyLayer,
-            required_header::AddRequiredResponseHeadersLayer, trace::TraceLayer,
+            remove_header::{RemoveRequestHeaderLayer, RemoveResponseHeaderLayer},
+            required_header::AddRequiredResponseHeadersLayer,
+            trace::TraceLayer,
         },
         server::HttpServer,
         service::web::response::IntoResponse,
@@ -175,8 +177,7 @@ async fn main() -> Result<(), BoxError> {
         )
         .with_default_http_connector(exec)
         // NOTE: up to you define if a pool is acceptable, and especially a global one...
-        .try_with_default_connection_pool()
-        .context("build easy web client w/ pool")?
+        .with_default_connection_pool()
         .build_client();
 
     let optional_dns_overwrite_layer_used_for_e2e_only =
@@ -200,9 +201,11 @@ async fn main() -> Result<(), BoxError> {
     let http_svc = Arc::new(
         (
             ConsumeErrLayer::trace_as_debug(),
+            RemoveRequestHeaderLayer::hop_by_hop(),
             MapResponseBodyLayer::new_boxed_streaming_body(),
             TraceLayer::new_for_http(),
             AddRequiredResponseHeadersLayer::new(),
+            RemoveResponseHeaderLayer::hop_by_hop(),
         )
             .into_layer(HttpsMITMService { https_client }),
     );

@@ -29,7 +29,7 @@ use rama::{
             required_header::{AddRequiredRequestHeadersLayer, AddRequiredResponseHeadersLayer},
             set_header::SetResponseHeaderLayer,
             trace::TraceLayer,
-            upgrade::{DefaultHttpProxyConnectReplyService, UpgradeLayer},
+            upgrade::{EagerHttpProxyConnector, UpgradeLayer},
         },
         matcher::MethodMatcher,
         server::HttpServer,
@@ -39,23 +39,26 @@ use rama::{
         },
     },
     io::Io,
+    layer::TimeoutLayer,
     net::{
         Protocol,
         address::{ProxyAddress, SocketAddress},
+        client::ProxyRoute,
         proxy::IoForwardService,
+        tls::ApplicationProtocol,
         user::credentials::{ProxyCredential, basic},
     },
     proxy::socks5::Socks5Acceptor,
     rt::Executor,
     service::{BoxService, service_fn},
-    tcp::{proxy::IoToProxyBridgeIoLayer, server::TcpListener},
+    tcp::{client::service::TcpConnector, server::TcpListener},
     telemetry::tracing::{self},
     tls::{
-        ApplicationProtocol,
+        boring,
         client::{ServerVerifyMode, TlsClientConfig},
-        server::{SelfSignedData, TlsServerConfig},
+        rustls,
+        server::{GeneratedServerAuthConfig, TlsServerConfig},
     },
-    tls::{boring, rustls},
     utils::collections::smallvec::smallvec,
 };
 
@@ -219,7 +222,7 @@ where
 
 fn get_config_tls_data(params: TestParameters) -> TlsServerConfig {
     let tls = TlsServerConfig::new()
-        .try_with_self_signed(SelfSignedData::default())
+        .try_with_generated_server_auth(GeneratedServerAuthConfig::default())
         .expect("self signed");
     match params.version {
         HttpVersion::Http1 => tls.with_alpn_http_1(),
@@ -245,16 +248,14 @@ where
         }
     };
 
+    let connect = EagerHttpProxyConnector::new(
+        TimeoutLayer::new(Duration::from_secs(30)).into_layer(TcpConnector::new()),
+        IoForwardService::new(Executor::default()),
+    );
     let http_service = (
         TraceLayer::new_for_http(),
         CompressionLayer::new(),
-        UpgradeLayer::new(
-            Executor::default(),
-            MethodMatcher::CONNECT,
-            DefaultHttpProxyConnectReplyService::new(),
-            IoToProxyBridgeIoLayer::extension_connector_target()
-                .into_layer(IoForwardService::new(Executor::default())),
-        ),
+        UpgradeLayer::new(Executor::default(), MethodMatcher::CONNECT, connect),
         RemoveResponseHeaderLayer::hop_by_hop(),
         RemoveRequestHeaderLayer::hop_by_hop(),
     )
@@ -387,6 +388,7 @@ fn get_inner_client(
             .with_proxy_support()
             .without_tls_support()
             .with_default_http_connector(Executor::default())
+            .without_connection_pool()
             .build_client(),
         Tls::Rustls => {
             let tls_config = TlsClientConfig::new()
@@ -399,6 +401,7 @@ fn get_inner_client(
                 .with_proxy_support()
                 .with_tls_support_using_rustls(tls_config)
                 .with_default_http_connector(Executor::default())
+                .without_connection_pool()
                 .build_client()
         }
         Tls::Boring => {
@@ -412,6 +415,7 @@ fn get_inner_client(
                 .with_proxy_support()
                 .with_tls_support_using_boringssl(tls_config)
                 .with_default_http_connector(Executor::default())
+                .without_connection_pool()
                 .build_client()
         }
     }
@@ -475,15 +479,15 @@ fn bench_http_transport(bencher: divan::Bencher, params: TestParameters) {
 
                 let req_with_maybe_proxy = match params.proxy {
                     Proxy::None => req,
-                    Proxy::Http => req.extension(
+                    Proxy::Http => req.extension(ProxyRoute::Proxy(
                         ProxyAddress::try_from(format!("http://{}", address_proxy.clone()))
                             .unwrap(),
-                    ),
-                    Proxy::Socks5 => req.extension(ProxyAddress {
+                    )),
+                    Proxy::Socks5 => req.extension(ProxyRoute::Proxy(ProxyAddress {
                         protocol: Some(Protocol::SOCKS5),
                         address: address_proxy.into(),
                         credential: Some(ProxyCredential::Basic(basic!("john", "secret"))),
-                    }),
+                    })),
                 };
 
                 let resp = tokio::time::timeout(REQUEST_TIMEOUT, req_with_maybe_proxy.send())

@@ -164,6 +164,7 @@ where
                     http_client_service: self,
                     state: RequestBuilderState::Error(err),
                     _phantom: std::marker::PhantomData,
+                    _mode: std::marker::PhantomData,
                 };
             }
         };
@@ -174,6 +175,7 @@ where
             http_client_service: self,
             state: RequestBuilderState::PreBody(builder),
             _phantom: std::marker::PhantomData,
+            _mode: std::marker::PhantomData,
         }
     }
 
@@ -185,6 +187,7 @@ where
             http_client_service: self,
             state: RequestBuilderState::PostBody(request.map(Into::into)),
             _phantom: std::marker::PhantomData,
+            _mode: std::marker::PhantomData,
         }
     }
 
@@ -239,7 +242,6 @@ impl IntoHeaderValue for &[u8] {}
 mod private {
 
     use rama_http_types::HeaderName;
-    use rama_net::Protocol;
 
     use super::*;
 
@@ -249,17 +251,13 @@ mod private {
 
     impl IntoUrlSealed for Uri {
         fn into_url(self) -> Result<Uri, BoxError> {
-            let protocol: Option<Protocol> = self.scheme().cloned();
-            match protocol {
-                Some(protocol) => {
-                    if protocol.is_http() || protocol.is_ws() {
-                        Ok(self)
-                    } else {
-                        Err(BoxError::from_static_str("unsupported protocol")
-                            .context_field("protocol", protocol))
-                    }
-                }
-                None => Err(BoxError::from_static_str("Missing scheme in URI")),
+            // any scheme goes: layers such as `FileUriLayer` / `DataUriLayer`
+            // extend a client beyond http, and the connector rejects what it
+            // cannot serve anyway
+            if self.scheme().is_some() {
+                Ok(self)
+            } else {
+                Err(BoxError::from_static_str("Missing scheme in URI"))
             }
         }
     }
@@ -384,13 +382,31 @@ mod private {
 /// A builder to construct the properties of a [`Request`].
 ///
 /// Constructed using [`HttpClientExt`].
-pub struct RequestBuilder<'a, S, Response> {
-    http_client_service: &'a S,
-    state: RequestBuilderState,
+pub struct RequestBuilder<'a, S, Response, Mode = request_builder_mode::Async> {
+    pub(super) http_client_service: &'a S,
+    pub(super) state: RequestBuilderState,
     _phantom: std::marker::PhantomData<fn(Response) -> ()>,
+    _mode: std::marker::PhantomData<fn(Mode) -> ()>,
 }
 
-impl<S, Response> std::fmt::Debug for RequestBuilder<'_, S, Response>
+/// A request builder whose terminal operations block the calling thread.
+pub type BlockingRequestBuilder<'a, S, Response> =
+    RequestBuilder<'a, S, Response, request_builder_mode::Blocking>;
+
+/// Request builder execution modes.
+pub mod request_builder_mode {
+    /// Asynchronous terminal request operations.
+    #[derive(Debug)]
+    #[non_exhaustive]
+    pub struct Async;
+
+    /// Blocking terminal request operations.
+    #[derive(Debug)]
+    #[non_exhaustive]
+    pub struct Blocking;
+}
+
+impl<S, Response, Mode> std::fmt::Debug for RequestBuilder<'_, S, Response, Mode>
 where
     S: std::fmt::Debug,
 {
@@ -403,16 +419,31 @@ where
 }
 
 #[derive(Debug)]
-enum RequestBuilderState {
+pub(super) enum RequestBuilderState {
     PreBody(crate::request::Builder),
     PostBody(crate::Request),
     Error(BoxError),
 }
 
-impl<S, Body> RequestBuilder<'_, S, Response<Body>>
-where
-    S: Service<Request, Output = Response<Body>, Error: Into<BoxError>>,
-{
+pub(super) fn request_builder_state(method: Method, url: impl IntoUrl) -> RequestBuilderState {
+    match private::IntoUrlSealed::into_url(url) {
+        Ok(uri) => {
+            RequestBuilderState::PreBody(crate::request::Builder::new().method(method).uri(uri))
+        }
+        Err(err) => RequestBuilderState::Error(err),
+    }
+}
+
+impl<'a, S, Body, Mode> RequestBuilder<'a, S, Response<Body>, Mode> {
+    pub(super) fn from_state(http_client_service: &'a S, state: RequestBuilderState) -> Self {
+        Self {
+            http_client_service,
+            state,
+            _phantom: std::marker::PhantomData,
+            _mode: std::marker::PhantomData,
+        }
+    }
+
     /// Add a `Header` to this [`Request`].
     #[must_use]
     pub fn header<K, V>(mut self, key: K, value: V) -> Self
@@ -886,17 +917,31 @@ where
         }
     }
 
+    /// Construct the [`Request`] without sending it.
+    ///
+    /// # Errors
+    ///
+    /// This method fails if there was an error while constructing the [`Request`].
+    pub fn build(self) -> Result<Request, BoxError> {
+        Ok(match self.state {
+            RequestBuilderState::PreBody(builder) => builder.body(crate::Body::empty())?,
+            RequestBuilderState::PostBody(request) => request,
+            RequestBuilderState::Error(err) => return Err(err),
+        })
+    }
+}
+
+impl<S, Body> RequestBuilder<'_, S, Response<Body>>
+where
+    S: Service<Request, Output = Response<Body>, Error: Into<BoxError>>,
+{
     /// Constructs the [`Request`].
     ///
     /// # Errors
     ///
     /// This method fails if there was an error while constructing the [`Request`].
     pub async fn try_into_request(self) -> Result<Request, BoxError> {
-        Ok(match self.state {
-            RequestBuilderState::PreBody(builder) => builder.body(crate::Body::empty())?,
-            RequestBuilderState::PostBody(request) => request,
-            RequestBuilderState::Error(err) => return Err(err),
-        })
+        self.build()
     }
 
     /// Constructs the [`Request`] and sends it to the target [`Uri`], returning a future [`Response`].
@@ -905,14 +950,11 @@ where
     ///
     /// This method fails if there was an error while sending [`Request`].
     pub async fn send(self) -> Result<Response<Body>, BoxError> {
-        let request = match self.state {
-            RequestBuilderState::PreBody(builder) => builder.body(crate::Body::empty())?,
-            RequestBuilderState::PostBody(request) => request,
-            RequestBuilderState::Error(err) => return Err(err),
-        };
+        let http_client_service = self.http_client_service;
+        let request = self.build()?;
 
         let uri = request.uri().clone();
-        match self.http_client_service.serve(request).await {
+        match http_client_service.serve(request).await {
             Ok(response) => Ok(response),
             Err(err) => Err(err.into().context(uri)),
         }
@@ -930,14 +972,11 @@ where
     ///
     /// This method fails if there was an error while sending [`Request`].
     pub async fn send_with_timeout(self, t: Duration) -> Result<Response<Body>, BoxError> {
-        let request = match self.state {
-            RequestBuilderState::PreBody(builder) => builder.body(crate::Body::empty())?,
-            RequestBuilderState::PostBody(request) => request,
-            RequestBuilderState::Error(err) => return Err(err),
-        };
+        let http_client_service = self.http_client_service;
+        let request = self.build()?;
 
         let uri = request.uri().clone();
-        match tokio::time::timeout(t, self.http_client_service.serve(request)).await {
+        match tokio::time::timeout(t, http_client_service.serve(request)).await {
             Ok(Ok(response)) => Ok(response),
             Err(err) => Err(err
                 .context("roundtrip timeout reached")
@@ -1111,6 +1150,33 @@ mod test {
         use crate::body::util::BodyExt as _;
         let bytes = resp.into_body().collect().await.unwrap().to_bytes();
         String::from_utf8(bytes.to_vec()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn test_any_scheme_reaches_the_inner_service() {
+        // scheme-extending layers (file://, data:, ...) live above the
+        // client, so IntoUrl must not gatekeep on the scheme
+        let uri_client = || {
+            (MapResultLayer::new(map_internal_client_error),)
+                .into_layer(service_fn(async |req: Request| {
+                    Ok::<_, Infallible>(req.uri().to_string().into_response())
+                }))
+                .boxed()
+        };
+
+        for uri in [
+            "wibble://example.com/x",
+            "file:///tmp/pac.js",
+            "data:,hello",
+            "urn:isbn:0451450523",
+        ] {
+            let resp = uri_client().get(uri).send().await.unwrap();
+            assert_eq!(dump_headers(resp).await, uri);
+        }
+
+        // a scheme-less URI stays an error: there is nothing to route on
+        let err = uri_client().get("/just/a/path").send().await.unwrap_err();
+        assert!(err.to_string().contains("Missing scheme"), "{err}");
     }
 
     #[tokio::test]

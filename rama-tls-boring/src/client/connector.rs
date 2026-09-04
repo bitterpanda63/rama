@@ -2,32 +2,36 @@ use rama_boring::ssl::{ConnectConfiguration, SslAlert, SslVerifyError, SslVerify
 use rama_boring_tokio::{HandshakeError, SslStream};
 use rama_core::conversion::RamaTryInto;
 use rama_core::error::BoxErrorExt as _;
-use rama_core::error::{BoxError, ErrorContext as _, ErrorExt};
+use rama_core::error::{BoxError, ErrorContext, ErrorExt};
 use rama_core::extensions::{Extensions, ExtensionsRef};
 use rama_core::io::Io;
 use rama_core::telemetry::tracing;
 use rama_core::{Layer, Service};
 use rama_crypto::pki_types::CertificateDer;
-use rama_net::address::{Domain, Host};
-use rama_net::client::{ConnectorService, EstablishedClientConnection};
+use rama_net::address::Host;
+use rama_net::client::{
+    ConnectionError, ConnectionErrorKind, ConnectorService, EstablishedClientConnection,
+};
 use rama_net::extensions::StreamTransformed;
-use rama_net::{AuthorityInputExt, ProtocolInputExt};
-use rama_tls::ApplicationProtocol;
+use rama_net::{
+    AuthorityInputExt, Protocol, ProtocolInputExt,
+    tls::{ApplicationProtocol, TlsAlpn, default_tls_alpn},
+};
 use rama_tls::client::{
     NegotiatedTlsParameters, ServerVerifyMode, TlsClientConfig, TlsServerCertPinCheck,
-    TlsServerCertPins,
+    TlsServerCertPins, TlsServerIdentity,
 };
-#[cfg(feature = "http")]
-use rama_utils::collections::smallvec::smallvec;
+use rama_tls::{TlsTunnelMode, resolve_tls_tunnel};
 use rama_utils::macros::generate_set_and_with;
 use std::fmt;
 
-use super::{AutoTlsStream, BoringTlsConnectorConfig, TlsConnectorData};
+#[cfg(feature = "http")]
+use super::set_alpn_with_coupled_alps;
+use super::{
+    AutoTlsStream, BoringTlsConnectorConfig, TlsConnectorData, set_alpn_list_with_coupled_alps,
+};
 
 use crate::{TlsStream, types::TlsTunnel};
-#[cfg(feature = "http")]
-use rama_tls::TlsAlpn;
-
 #[cfg(feature = "http")]
 use rama_net::http::{TargetHttpVersion, Version};
 
@@ -44,9 +48,9 @@ impl<K> TlsConnectorLayer<K> {
     generate_set_and_with!(
         /// Set the base [`TlsClientConfig`] for this connector.
         ///
-        /// Per-connection pieces inserted in the request's extensions are layered
-        /// on top of this base, so these are basically the defaults if the request
-        /// doesn't specify them.
+        /// Auto and secure connectors layer per-request TLS pieces on top of this
+        /// base. Tunnel connectors intentionally use only this base plus the
+        /// proxy-scoped [`TlsTunnel`] fields.
         ///
         /// NOTE: for a smooth interaction with HTTP you most likely want to at
         /// least define the ALPN protocols (e.g. [`TlsClientConfig::with_alpn_http_auto`]);
@@ -87,10 +91,10 @@ impl TlsConnectorLayer<ConnectorKindTunnel> {
     /// Creates a new [`TlsConnectorLayer`] which will establish
     /// a secure connection if the request is to be tunneled.
     #[must_use]
-    pub fn tunnel(sni: Option<Domain>) -> Self {
+    pub fn tunnel(host: Option<Host>) -> Self {
         Self {
             base: None,
-            kind: ConnectorKindTunnel { sni },
+            kind: ConnectorKindTunnel { host },
         }
     }
 }
@@ -148,9 +152,9 @@ impl<S, K> TlsConnector<S, K> {
     generate_set_and_with!(
         /// Set the base [`TlsClientConfig`] for this connector.
         ///
-        /// Per-connection pieces inserted in the request's extensions are layered
-        /// on top of this base, so these are basically the defaults if the request
-        /// doesn't specify them.
+        /// Auto and secure connectors layer per-request TLS pieces on top of this
+        /// base. Tunnel connectors intentionally use only this base plus the
+        /// proxy-scoped [`TlsTunnel`] fields.
         pub fn base_config(mut self, base: Option<TlsClientConfig>) -> Self {
             self.base_config = base;
             self
@@ -178,8 +182,8 @@ impl<S> TlsConnector<S, ConnectorKindSecure> {
 impl<S> TlsConnector<S, ConnectorKindTunnel> {
     /// Creates a new [`TlsConnector`] which will establish
     /// a secure connection if the request is to be tunneled.
-    pub const fn tunnel(inner: S, sni: Option<Domain>) -> Self {
-        Self::new(inner, ConnectorKindTunnel { sni })
+    pub const fn tunnel(inner: S, host: Option<Host>) -> Self {
+        Self::new(inner, ConnectorKindTunnel { host })
     }
 }
 
@@ -191,15 +195,17 @@ where
     Input: AuthorityInputExt + ProtocolInputExt + Send + ExtensionsRef + 'static,
 {
     type Output = EstablishedClientConnection<AutoTlsStream<S::Connection>, Input>;
-    type Error = BoxError;
+    type Error = ConnectionError;
 
     async fn serve(&self, input: Input) -> Result<Self::Output, Self::Error> {
-        let EstablishedClientConnection { input, conn } =
-            self.inner.connect(input).await.into_box_error()?;
+        let EstablishedClientConnection { input, conn } = self.inner.connect(input).await?;
 
-        let authority = input
-            .authority()
-            .context("TlsConnector(auto): resolve authority")?;
+        let authority = input.authority().ok_or_else(|| {
+            ConnectionError::local(
+                BoxError::from_static_str("TlsConnector(auto): authority missing from input"),
+                ConnectionErrorKind::InvalidInput,
+            )
+        })?;
         let app_protocol = input.protocol();
 
         if !app_protocol
@@ -218,11 +224,19 @@ where
             });
         }
 
-        // Preserve the authority host for pin scoping. `connector_data`
-        // separately derives DNS-only SNI from it.
-        let connector_data = self.connector_data(input.extensions(), Some(&authority.host))?;
+        // Use the authority host as the certificate identity unless overridden.
+        let connector_data = self
+            .connector_data(input.extensions(), app_protocol, Some(&authority.host))
+            .map_err(|error| {
+                ConnectionError::local(error, ConnectionErrorKind::InvalidInput)
+                    .context("TlsConnector(auto): build connector configuration")
+            })?;
 
-        let (stream, negotiated_params) = handshake(connector_data, conn).await?;
+        let (stream, negotiated_params) =
+            handshake(connector_data, conn).await.map_err(|error| {
+                ConnectionError::application(error, ConnectionErrorKind::Protocol)
+                    .context("TlsConnector(auto): TLS handshake")
+            })?;
 
         tracing::trace!(
             server.address = %authority.host,
@@ -233,7 +247,16 @@ where
         let conn = AutoTlsStream::secure(stream);
 
         #[cfg(feature = "http")]
-        set_target_http_version(input.extensions(), conn.extensions(), &negotiated_params)?;
+        set_target_http_version(
+            app_protocol,
+            input.extensions(),
+            conn.extensions(),
+            &negotiated_params,
+        )
+        .map_err(|error| {
+            ConnectionError::application(error, ConnectionErrorKind::Protocol)
+                .context("TlsConnector(auto): validate negotiated HTTP version")
+        })?;
 
         conn.extensions().insert(negotiated_params);
         conn.extensions().insert(StreamTransformed {
@@ -249,15 +272,17 @@ where
     Input: AuthorityInputExt + ProtocolInputExt + Send + ExtensionsRef + 'static,
 {
     type Output = EstablishedClientConnection<TlsStream<S::Connection>, Input>;
-    type Error = BoxError;
+    type Error = ConnectionError;
 
     async fn serve(&self, input: Input) -> Result<Self::Output, Self::Error> {
-        let EstablishedClientConnection { input, conn } =
-            self.inner.connect(input).await.into_box_error()?;
+        let EstablishedClientConnection { input, conn } = self.inner.connect(input).await?;
 
-        let authority = input
-            .authority()
-            .context("TlsConnector(secure): resolve authority")?;
+        let authority = input.authority().ok_or_else(|| {
+            ConnectionError::local(
+                BoxError::from_static_str("TlsConnector(secure): authority missing from input"),
+                ConnectionErrorKind::InvalidInput,
+            )
+        })?;
         tracing::trace!(
             server.address = %authority.host,
             server.port = authority.port_u16(),
@@ -265,13 +290,31 @@ where
             input.protocol(),
         );
 
-        let connector_data = self.connector_data(input.extensions(), Some(&authority.host))?;
+        let app_protocol = input.protocol();
+        let connector_data = self
+            .connector_data(input.extensions(), app_protocol, Some(&authority.host))
+            .map_err(|error| {
+                ConnectionError::local(error, ConnectionErrorKind::InvalidInput)
+                    .context("TlsConnector(secure): build connector configuration")
+            })?;
 
-        let (conn, negotiated_params) = handshake(connector_data, conn).await?;
+        let (conn, negotiated_params) = handshake(connector_data, conn).await.map_err(|error| {
+            ConnectionError::application(error, ConnectionErrorKind::Protocol)
+                .context("TlsConnector(secure): TLS handshake")
+        })?;
         let conn = TlsStream::new(conn);
 
         #[cfg(feature = "http")]
-        set_target_http_version(input.extensions(), conn.extensions(), &negotiated_params)?;
+        set_target_http_version(
+            app_protocol,
+            input.extensions(),
+            conn.extensions(),
+            &negotiated_params,
+        )
+        .map_err(|error| {
+            ConnectionError::application(error, ConnectionErrorKind::Protocol)
+                .context("TlsConnector(secure): validate negotiated HTTP version")
+        })?;
 
         conn.extensions().insert(negotiated_params);
         conn.extensions().insert(StreamTransformed {
@@ -287,24 +330,16 @@ where
     Input: Send + ExtensionsRef + 'static,
 {
     type Output = EstablishedClientConnection<AutoTlsStream<S::Connection>, Input>;
-    type Error = BoxError;
+    type Error = ConnectionError;
 
     async fn serve(&self, input: Input) -> Result<Self::Output, Self::Error> {
-        let EstablishedClientConnection { input, conn } =
-            self.inner.connect(input).await.into_box_error()?;
+        let EstablishedClientConnection { input, conn } = self.inner.connect(input).await?;
 
-        let maybe_server_host = if let Some(tunnel) = input.extensions().get_ref::<TlsTunnel>() {
-            tunnel
-                .sni
-                .as_ref()
-                .map(std::borrow::Cow::Borrowed)
-                .or_else(|| {
-                    self.kind
-                        .sni
-                        .as_ref()
-                        .map(|name| std::borrow::Cow::Owned(Host::from(name.clone())))
-                })
-        } else {
+        let tunnel = input.extensions().get_ref::<TlsTunnel>().cloned();
+
+        let TlsTunnelMode::Tls(maybe_server_host) =
+            resolve_tls_tunnel(tunnel.as_ref(), self.kind.host.as_ref())
+        else {
             tracing::trace!(
                 "TlsConnector(tunnel): return inner connection: no Tls tunnel is requested"
             );
@@ -314,14 +349,22 @@ where
             });
         };
 
-        let connector_data =
-            self.connector_data(input.extensions(), maybe_server_host.as_deref())?;
+        let tunnel_protocol = tunnel
+            .as_ref()
+            .and_then(|tunnel| tunnel.application_protocol.as_ref());
+        let connector_data = self
+            .tunnel_connector_data(tunnel.as_ref(), tunnel_protocol, maybe_server_host)
+            .map_err(|error| {
+                ConnectionError::local(error, ConnectionErrorKind::InvalidInput)
+                    .context("TlsConnector(tunnel): build connector configuration")
+            })?;
 
-        let (stream, negotiated_params) = handshake(connector_data, conn).await?;
+        let (stream, negotiated_params) =
+            handshake(connector_data, conn).await.map_err(|error| {
+                ConnectionError::transport(error, ConnectionErrorKind::Protocol)
+                    .context("TlsConnector(tunnel): TLS handshake")
+            })?;
         let conn = AutoTlsStream::secure(stream);
-
-        #[cfg(feature = "http")]
-        set_target_http_version(input.extensions(), conn.extensions(), &negotiated_params)?;
 
         conn.extensions().insert(negotiated_params);
         conn.extensions().insert(StreamTransformed {
@@ -332,29 +375,25 @@ where
     }
 }
 
-/// SNI extraction with IP-first policy (RFC 6066 §3 forbids IP literals
-/// in SNI). Returns `None` for IP-shaped hosts (including pct-encoded
-/// IP literals inside `Uninterpreted`) and for non-promotable
-/// reg-names / IPvFuture; otherwise returns the bridged [`Domain`].
-///
-/// The IP-first guard exists because `Domain::try_from("127.0.0.1")`
-/// succeeds — RFC 1123 §2.1 permits all-digit DNS labels — so an
-/// IPv4-shaped reg-name (`Host::Uninterpreted("127.0.0.1")` or the
-/// pct-encoded form `%31%32%37.0.0.1`) would otherwise promote to a
-/// "domain" of `"127.0.0.1"` and ship as SNI. RFC 6066 forbids that.
-fn sni_domain_for(host: &rama_net::address::Host) -> Option<std::borrow::Cow<'_, Domain>> {
-    if host.try_as_ip().is_ok() {
-        return None;
+fn server_identity_for(host: &Host) -> Result<String, BoxError> {
+    match TlsServerIdentity::try_from(host)
+        .context("server identity is not a DNS name or IP address")?
+    {
+        TlsServerIdentity::Dns(domain) => Ok(domain.as_str().to_owned()),
+        TlsServerIdentity::Ip(ip) => Ok(ip.to_string()),
     }
-    host.try_as_domain().ok()
 }
 
 #[cfg(feature = "http")]
 fn set_target_http_version(
+    application_protocol: Option<&Protocol>,
     request_extensions: &Extensions,
     conn_extensions: &Extensions,
     tls_params: &NegotiatedTlsParameters,
 ) -> Result<(), BoxError> {
+    if !application_protocol.is_some_and(Protocol::is_http_based) {
+        return Ok(());
+    }
     if let Some(proto) = tls_params.application_layer_protocol.as_ref() {
         let neg_version: Version = proto.try_into()?;
         if let Some(target_version) = request_extensions.get_ref::<TargetHttpVersion>()
@@ -377,36 +416,85 @@ fn set_target_http_version(
 }
 
 impl<S, K> TlsConnector<S, K> {
+    fn tunnel_connector_data(
+        &self,
+        tunnel: Option<&TlsTunnel>,
+        application_protocol: Option<&Protocol>,
+        maybe_server_host: Option<&Host>,
+    ) -> Result<TlsConnectorData, BoxError> {
+        let effective = self.tunnel_config_extensions(tunnel, application_protocol);
+
+        let mut data =
+            TlsConnectorData::try_from(BoringTlsConnectorConfig::from_extensions(&effective))?;
+        if data.server_name.is_none() {
+            data.server_name = maybe_server_host.cloned();
+        }
+        Ok(data)
+    }
+
+    fn tunnel_config_extensions(
+        &self,
+        tunnel: Option<&TlsTunnel>,
+        application_protocol: Option<&Protocol>,
+    ) -> Extensions {
+        let effective = Extensions::new();
+        if let Some(base) = &self.base_config {
+            effective.extend(base.as_extensions());
+        }
+        if let Some(alpn) = tunnel.and_then(|tunnel| tunnel.alpn.clone()) {
+            effective.insert(alpn);
+        }
+
+        apply_default_alpn(&effective, application_protocol);
+        effective
+    }
+
     fn connector_data(
         &self,
-        extensions: &Extensions,
+        request_extensions: &Extensions,
+        application_protocol: Option<&Protocol>,
         maybe_server_host: Option<&Host>,
     ) -> Result<TlsConnectorData, BoxError> {
         // Create new extensions only for this function that also apply the base_config
+        let effective = request_extensions.fork();
         let extensions = if let Some(base) = &self.base_config {
-            &extensions.with_base(base.as_extensions())
+            effective.with_base(base.as_extensions())
         } else {
-            extensions
+            effective
         };
+
+        apply_default_alpn(&extensions, application_protocol);
 
         // When HTTP pins a concrete target version, force the TLS ALPN to match
         // it before the handshake
         #[cfg(feature = "http")]
-        resolve_http_alpn(extensions)?;
+        resolve_http_alpn(&extensions, application_protocol)?;
 
         let mut data =
-            TlsConnectorData::try_from(BoringTlsConnectorConfig::from_extensions(extensions))?;
+            TlsConnectorData::try_from(BoringTlsConnectorConfig::from_extensions(&extensions))?;
 
-        // A configured server name overrides both pin scope and SNI. Otherwise
-        // preserve the transport host for pin scope while deriving DNS-only SNI.
-        if data.pin_server_name.is_none() {
-            data.pin_server_name = maybe_server_host.cloned();
-            data.server_name = maybe_server_host
-                .and_then(sni_domain_for)
-                .map(std::borrow::Cow::into_owned);
+        // A configured server identity overrides the transport host.
+        if data.server_name.is_none() {
+            data.server_name = maybe_server_host.cloned();
         }
 
         Ok(data)
+    }
+}
+
+fn apply_default_alpn(effective_extensions: &Extensions, application_protocol: Option<&Protocol>) {
+    // Any ALPN in the effective chain is explicit connector policy, whether
+    // supplied by the request or inherited from a base configuration.
+    let alpn = effective_extensions
+        .get_ref::<TlsAlpn>()
+        .cloned()
+        .or_else(|| {
+            application_protocol
+                .map(|protocol| default_tls_alpn(protocol).unwrap_or_else(TlsAlpn::empty))
+        });
+    if let Some(alpn) = alpn {
+        let coupling = set_alpn_list_with_coupled_alps(effective_extensions, alpn);
+        tracing::trace!(?coupling, "coupled ALPS to protocol-derived TLS ALPN");
     }
 }
 
@@ -414,7 +502,13 @@ impl<S, K> TlsConnector<S, K> {
 /// one. Otherwise protocols like WebSocket can negotiate `h2` even though the
 /// request requires an HTTP/1.1 upgrade.
 #[cfg(feature = "http")]
-fn resolve_http_alpn(ext: &Extensions) -> Result<(), BoxError> {
+fn resolve_http_alpn(
+    ext: &Extensions,
+    application_protocol: Option<&Protocol>,
+) -> Result<(), BoxError> {
+    if application_protocol.is_some_and(|protocol| !protocol.is_http_based()) {
+        return Ok(());
+    }
     let Some(target_version) = ext.get_ref::<TargetHttpVersion>() else {
         return Ok(());
     };
@@ -426,7 +520,8 @@ fn resolve_http_alpn(ext: &Extensions) -> Result<(), BoxError> {
         "override TLS ALPN to match TargetHttpVersion",
     );
 
-    ext.insert(TlsAlpn(smallvec![target_alpn]));
+    let alps_coupling = set_alpn_with_coupled_alps(ext, target_alpn);
+    tracing::trace!(?alps_coupling, "coupled ALPS to forced TLS ALPN");
     Ok(())
 }
 
@@ -434,7 +529,7 @@ fn resolve_http_alpn(ext: &Extensions) -> Result<(), BoxError> {
 pub enum TlsConnectError<S> {
     Builder(BoxError),
     Handshake {
-        server_name: Option<Domain>,
+        server_name: Option<Host>,
         error: HandshakeError<S>,
     },
 }
@@ -446,8 +541,11 @@ impl<S> fmt::Display for TlsConnectError<S> {
             Self::Handshake { error, server_name } => {
                 write!(
                     f,
-                    "Handshake: {error} (SNI = '{}')",
-                    server_name.as_ref().map(|d| d.as_str()).unwrap_or_default()
+                    "Handshake: {error} (server identity = '{}')",
+                    server_name
+                        .as_ref()
+                        .map(ToString::to_string)
+                        .unwrap_or_default()
                 )
             }
         }
@@ -466,6 +564,10 @@ impl<S: std::fmt::Debug> std::error::Error for TlsConnectError<S> {
     }
 }
 
+/// Establish a TLS connection with the fully resolved connector data.
+///
+/// Normal verification requires a server identity. Identity-less connections
+/// are available only through an explicit [`ServerVerifyMode::Disable`].
 pub async fn tls_connect<T>(
     stream: T,
     connector_data: Option<TlsConnectorData>,
@@ -477,7 +579,6 @@ where
         mut config,
         store_server_certificate_chain: _,
         ref server_name,
-        ref pin_server_name,
         server_verify_mode,
         server_cert_pins,
     } = match connector_data {
@@ -487,19 +588,30 @@ where
         }
     };
 
+    if server_verify_mode == ServerVerifyMode::Auto && server_name.is_none() {
+        return Err(TlsConnectError::Builder(BoxError::from_static_str(
+            "server identity required when server verification is enabled",
+        )));
+    }
+
     configure_server_cert_pins(
         &mut config,
         server_verify_mode,
         server_cert_pins,
-        pin_server_name.as_ref(),
+        server_name.as_ref(),
     );
-    let sni = server_name.as_ref().map(|sni| sni.as_str());
-    let stream: SslStream<T> = rama_boring_tokio::connect(config, sni, stream)
-        .await
-        .map_err(|error| TlsConnectError::Handshake {
-            error,
-            server_name: server_name.clone(),
-        })?;
+    let server_identity = server_name
+        .as_ref()
+        .map(server_identity_for)
+        .transpose()
+        .map_err(TlsConnectError::Builder)?;
+    let stream: SslStream<T> =
+        rama_boring_tokio::connect(config, server_identity.as_deref(), stream)
+            .await
+            .map_err(|error| TlsConnectError::Handshake {
+                error,
+                server_name: server_name.clone(),
+            })?;
     Ok(TlsStream::new(stream))
 }
 
@@ -568,6 +680,12 @@ async fn handshake<T>(
 where
     T: Io + Unpin + ExtensionsRef,
 {
+    // High-level connectors always resolve an identity. Treat its absence as
+    // invalid connector state even when low-level verification is disabled.
+    if connector_data.server_name.is_none() {
+        return Err(BoxError::from_static_str("server identity missing"));
+    }
+
     let store_server_certificate_chain = connector_data.store_server_certificate_chain;
     #[cfg(feature = "dial9")]
     let dial9_server_name = connector_data.server_name.clone();
@@ -609,18 +727,18 @@ where
                         BoxError::from(format!(
                             "boring ssl connector (connect): with io error: {io_err}"
                         ))
-                        .context_debug_field("sni", server_name)
+                        .context_debug_field("server_identity", server_name)
                         .context_debug_field("code", maybe_ssl_code)
                     } else if let Some(ssl_error) = error.as_ssl_error_stack() {
                         ssl_error
                             .context("boring ssl connector (connect): with ssl-error info")
-                            .context_debug_field("sni", server_name)
+                            .context_debug_field("server_identity", server_name)
                             .context_debug_field("code", maybe_ssl_code)
                     } else {
                         BoxError::from_static_str(
                             "boring ssl connector (connect): without error info",
                         )
-                        .context_debug_field("sni", server_name)
+                        .context_debug_field("server_identity", server_name)
                         .context_debug_field("code", maybe_ssl_code)
                     }
                 }
@@ -682,7 +800,7 @@ where
             stream
                 .ssl()
                 .selected_alpn_protocol()
-                .map(rama_tls::ApplicationProtocol::from),
+                .map(rama_net::tls::ApplicationProtocol::from),
             depth,
         );
     }
@@ -710,19 +828,20 @@ pub struct ConnectorKindSecure;
 /// A connector which can be used to use this connector to support
 /// secure https tunnel connections.
 ///
-/// The connections will only be done if the [`TlsTunnel`]
-/// is present in the context for optional versions,
-/// and using the hardcoded domain otherwise.
-/// Context always overwrites though.
+/// TLS is requested when [`TlsTunnel`] is present or a hardcoded server
+/// identity is configured. A dedicated base-config identity takes precedence,
+/// followed by the tunnel identity and then this connector fallback.
 ///
 /// [`TlsTunnel`]: rama_tls::TlsTunnel
 pub struct ConnectorKindTunnel {
-    sni: Option<Domain>,
+    host: Option<Host>,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "http")]
+    use rama_net::tls::TlsAlpn;
 
     #[test]
     fn assert_send() {
@@ -738,37 +857,520 @@ mod tests {
         assert_sync::<TlsConnectorLayer>();
     }
 
-    /// Regression for the IP-first guard in [`sni_domain_for`].
-    /// `Host::Uninterpreted("127.0.0.1")` could otherwise promote to
-    /// Domain `"127.0.0.1"` and ship as SNI in violation of RFC 6066 §3.
     #[test]
-    fn sni_domain_for_drops_ip_shaped_uninterpreted() {
-        let host = rama_net::address::Host::try_from("127.0.0.1").unwrap();
-        assert!(sni_domain_for(&host).is_none());
-        // Pct-encoded equivalent also resolves to IpAddr first.
-        let host = rama_net::address::Host::try_from("%31%32%37.0.0.1").unwrap();
-        assert!(sni_domain_for(&host).is_none());
+    fn server_identity_canonicalizes_ips() {
+        let host = Host::from(std::net::Ipv4Addr::LOCALHOST);
+        assert_eq!(server_identity_for(&host).unwrap(), "127.0.0.1");
+
+        let host = Host::try_from("%31%32%37.0.0.1").unwrap();
+        assert_eq!(server_identity_for(&host).unwrap(), "127.0.0.1");
     }
 
     #[test]
-    fn sni_domain_for_keeps_pct_encoded_reg_name() {
-        // `exa%6Dple.com` bridges Uninterpreted → Domain "example.com".
-        let host = rama_net::address::Host::try_from("exa%6Dple.com").unwrap();
-        let domain = sni_domain_for(&host).expect("should bridge to Domain");
-        assert_eq!(domain.as_str(), "example.com");
+    fn server_identity_promotes_encoded_dns_name() {
+        let host = Host::try_from("exa%6Dple.com").unwrap();
+        assert_eq!(server_identity_for(&host).unwrap(), "example.com");
     }
 
     #[test]
-    fn connector_data_keeps_transport_ip_for_pin_scope_without_sni() {
+    fn server_identity_preserves_numeric_domain_for_ip_classification() {
+        let host = Host::Name(rama_net::address::Domain::try_from("127.0.0.1").unwrap());
+        assert_eq!(server_identity_for(&host).unwrap(), "127.0.0.1");
+    }
+
+    #[test]
+    fn server_identity_rejects_ipvfuture() {
+        let host = Host::try_from("[v1.fe80::a]").unwrap();
+        server_identity_for(&host).unwrap_err();
+    }
+
+    #[test]
+    fn connector_data_keeps_transport_ip_as_server_identity() {
         let connector = TlsConnector::secure(());
         let extensions = Extensions::new();
         let host = Host::from(std::net::Ipv4Addr::LOCALHOST);
 
         let data = connector
-            .connector_data(&extensions, Some(&host))
+            .connector_data(&extensions, None, Some(&host))
             .expect("connector data");
 
-        assert_eq!(data.pin_server_name, Some(host));
-        assert!(data.server_name.is_none());
+        assert_eq!(data.server_name, Some(host));
+    }
+
+    #[test]
+    fn tunnel_config_uses_only_base_and_explicit_tunnel_policy() {
+        use rama_tls::client::{TlsServerName, TlsServerVerify};
+
+        let base_name = Host::from_static("proxy-cert.example");
+        let route_name = Host::from_static("proxy-route.example");
+        let connector = TlsConnector::tunnel((), None).with_base_config(
+            TlsClientConfig::new()
+                .with_alpn_http_2()
+                .with_server_name(base_name.clone())
+                .with_server_verify(ServerVerifyMode::Disable),
+        );
+        let tunnel = TlsTunnel {
+            server_identity: Some(route_name),
+            application_protocol: Some(Protocol::HTTPS),
+            alpn: Some(TlsAlpn::http_1()),
+        };
+
+        let effective = connector.tunnel_config_extensions(Some(&tunnel), Some(&Protocol::HTTPS));
+        assert_eq!(
+            effective.get_ref::<TlsAlpn>().cloned(),
+            Some(TlsAlpn::http_1())
+        );
+        assert_eq!(
+            effective
+                .get_ref::<TlsServerName>()
+                .map(|server_name| server_name.0.clone()),
+            Some(base_name.clone())
+        );
+        assert_eq!(
+            effective
+                .get_ref::<TlsServerVerify>()
+                .map(|verify| verify.0),
+            Some(ServerVerifyMode::Disable)
+        );
+
+        let data = connector
+            .tunnel_connector_data(Some(&tunnel), Some(&Protocol::HTTPS), None)
+            .expect("tunnel connector data");
+        assert_eq!(data.server_name, Some(base_name));
+    }
+
+    #[test]
+    fn tunnel_config_isolates_all_origin_tls_extensions() {
+        use crate::client::BoringClientConfigExt as _;
+        use rama_crypto::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+        use rama_tls::{
+            KeyLogIntent, ProtocolVersion, TlsKeyLog,
+            client::{
+                ClientAuth, ClientAuthData, ServerVerifyMode, TlsClientAuth, TlsServerCertPinCheck,
+                TlsServerCertPins, TlsServerTrust,
+            },
+        };
+
+        let base_name = Host::from_static("proxy-cert.example");
+        let base_pin = CertificateDer::from(vec![1, 2, 3]);
+        let base_pins = TlsServerCertPins::new(base_pin.clone());
+        let base_trust = TlsServerTrust::webpki_roots();
+        let base = TlsClientConfig::new()
+            .with_alpn_http_2()
+            .with_server_name(base_name.clone())
+            .with_server_verify(ServerVerifyMode::Disable)
+            .with_server_cert_pins(base_pins)
+            .with_server_trust(base_trust.clone())
+            .with_supported_versions(vec![ProtocolVersion::TLSv1_3])
+            .with_keylog(KeyLogIntent::Disabled)
+            .with_client_auth(ClientAuth::SelfSigned)
+            .with_store_server_cert_chain(true)
+            .with_grease(true);
+        let connector = TlsConnector::tunnel((), None).with_base_config(base);
+
+        let origin = Extensions::new();
+        TlsClientConfig::new()
+            .with_alpn_http_1()
+            .with_server_name(Host::from_static("origin.example"))
+            .with_server_verify(ServerVerifyMode::Auto)
+            .with_server_cert_pins(TlsServerCertPins::new(CertificateDer::from(vec![9])))
+            .with_server_trust(TlsServerTrust::default_roots())
+            .with_supported_versions(vec![ProtocolVersion::TLSv1_2])
+            .with_keylog(KeyLogIntent::Environment)
+            .with_client_auth(ClientAuth::Single(ClientAuthData {
+                cert_chain: vec![CertificateDer::from(vec![8])],
+                private_key: PrivatePkcs8KeyDer::from(vec![7]).into(),
+            }))
+            .with_store_server_cert_chain(false)
+            .with_grease(false)
+            .write_to(&origin);
+        origin.insert(TlsTunnel {
+            server_identity: Some(Host::from_static("proxy-route.example")),
+            application_protocol: Some(Protocol::HTTPS),
+            alpn: None,
+        });
+
+        let tunnel = origin.get_ref::<TlsTunnel>();
+        let effective = connector.tunnel_config_extensions(tunnel, Some(&Protocol::HTTPS));
+        let config = BoringTlsConnectorConfig::from_extensions(&effective);
+
+        assert_eq!(config.alpn.cloned(), Some(TlsAlpn::http_2()));
+        assert_eq!(
+            config.server_name.map(|name| name.0.clone()),
+            Some(base_name.clone())
+        );
+        assert_eq!(
+            config.verify.map(|verify| verify.0),
+            Some(ServerVerifyMode::Disable)
+        );
+        assert_eq!(config.server_trust, Some(&base_trust));
+        assert_eq!(
+            config.versions.map(|versions| versions.0.as_slice()),
+            Some([ProtocolVersion::TLSv1_3].as_slice())
+        );
+        assert!(matches!(
+            config.keylog,
+            Some(TlsKeyLog(KeyLogIntent::Disabled))
+        ));
+        assert!(matches!(
+            config.client_auth,
+            Some(TlsClientAuth(ClientAuth::SelfSigned))
+        ));
+        assert_eq!(config.store_chain.map(|store| store.0), Some(true));
+        assert_eq!(config.grease.map(|grease| grease.0), Some(true));
+        assert_eq!(
+            config
+                .server_cert_pins
+                .expect("base pins")
+                .check(Some(&base_name), &base_pin),
+            TlsServerCertPinCheck::Matched
+        );
+
+        let data = connector
+            .tunnel_connector_data(tunnel, Some(&Protocol::HTTPS), None)
+            .expect("resolved tunnel connector data");
+        assert_eq!(data.server_name, Some(base_name));
+        assert_eq!(data.server_verify_mode, ServerVerifyMode::Disable);
+        assert!(data.store_server_certificate_chain);
+        assert!(data.server_cert_pins.is_some());
+    }
+
+    #[test]
+    fn explicit_empty_tunnel_alpn_overrides_base() {
+        let connector = TlsConnector::tunnel((), None)
+            .with_base_config(TlsClientConfig::new().with_alpn_http_auto());
+        let tunnel = TlsTunnel {
+            server_identity: None,
+            application_protocol: Some(Protocol::HTTPS),
+            alpn: Some(TlsAlpn::empty()),
+        };
+
+        let effective = connector.tunnel_config_extensions(Some(&tunnel), Some(&Protocol::HTTPS));
+        assert_eq!(
+            effective.get_ref::<TlsAlpn>().cloned(),
+            Some(TlsAlpn::empty())
+        );
+    }
+
+    #[tokio::test]
+    async fn tunnel_handshake_uses_proxy_base_and_keeps_version_scoped() {
+        use rama_core::{ServiceInput, service::service_fn};
+        use rama_crypto::cert::generate_server_auth;
+        use rama_net::{client::EstablishedClientConnection, stream::service::EchoService};
+        use rama_tls::{
+            ProtocolVersion,
+            client::{ServerVerifyMode, TlsServerCertPins},
+            server::{GeneratedServerAuthConfig, ServerAuthData, TlsServerConfig},
+        };
+        use std::sync::Arc;
+
+        let (cert_chain, private_key) =
+            generate_server_auth(GeneratedServerAuthConfig::default()).expect("server auth");
+        let trust_anchor = cert_chain.last().expect("trust anchor").clone();
+        let server_pin = cert_chain.first().expect("leaf certificate").clone();
+        let server = crate::server::TlsAcceptorLayer::new(
+            TlsServerConfig::new()
+                .with_single_cert(ServerAuthData {
+                    cert_chain,
+                    private_key,
+                    ocsp: None,
+                })
+                .with_alpn_http_2(),
+        )
+        .into_layer(EchoService::new());
+
+        let (client_io, server_io) = tokio::io::duplex(64 * 1024);
+        let server_task =
+            tokio::spawn(async move { server.serve(ServiceInput::new(server_io)).await });
+        let client_io = Arc::new(parking_lot::Mutex::new(Some(client_io)));
+        let transport = service_fn(move |input: ServiceInput<()>| {
+            let conn = ServiceInput::new(client_io.lock().take().expect("one connection"));
+            async move { Ok::<_, ConnectionError>(EstablishedClientConnection { input, conn }) }
+        });
+        let proxy_base = TlsClientConfig::new()
+            .with_alpn_http_2()
+            .with_server_name(Host::from_static("localhost"))
+            .with_server_cert_pins(TlsServerCertPins::new(server_pin))
+            .with_server_verify(ServerVerifyMode::Auto)
+            .try_with_server_trust_anchors([trust_anchor])
+            .expect("proxy trust")
+            .with_supported_versions(vec![ProtocolVersion::TLSv1_3]);
+        let connector = TlsConnector::tunnel(transport, None).with_base_config(proxy_base);
+
+        let input = ServiceInput::new(());
+        TlsClientConfig::new()
+            .with_alpn_http_1()
+            .with_server_name(Host::from_static("origin.example"))
+            .with_server_verify(ServerVerifyMode::Disable)
+            .with_server_cert_pins(TlsServerCertPins::new(CertificateDer::from(vec![9])))
+            .write_to(input.extensions());
+        #[cfg(feature = "http")]
+        input
+            .extensions()
+            .insert(TargetHttpVersion(Version::HTTP_11));
+        input.extensions().insert(TlsTunnel {
+            server_identity: Some(Host::from_static("proxy-route.example")),
+            application_protocol: Some(Protocol::HTTPS),
+            alpn: None,
+        });
+
+        let established = connector.serve(input).await.expect("proxy TLS handshake");
+        let negotiated = established
+            .conn
+            .extensions()
+            .get_ref::<NegotiatedTlsParameters>()
+            .expect("proxy TLS parameters");
+        assert_eq!(
+            negotiated.application_layer_protocol,
+            Some(ApplicationProtocol::HTTP_2)
+        );
+        #[cfg(feature = "http")]
+        assert!(
+            established
+                .conn
+                .extensions()
+                .get_ref::<TargetHttpVersion>()
+                .is_none()
+        );
+        drop(established);
+        // The client is dropped immediately after the handshake assertions,
+        // so the TLS server may finish with an EOF/close-notify error.
+        let _server_result = tokio::time::timeout(std::time::Duration::from_secs(5), server_task)
+            .await
+            .expect("server shutdown")
+            .expect("server task");
+    }
+
+    #[tokio::test]
+    async fn handshake_rejects_missing_server_identity() {
+        let config = TlsConnectorData::try_from(
+            &TlsClientConfig::new().with_server_verify(ServerVerifyMode::Disable),
+        )
+        .unwrap();
+        let (stream, _) = tokio::io::duplex(64);
+        let error = handshake(config, rama_core::ServiceInput::new(stream))
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "server identity missing");
+    }
+
+    #[tokio::test]
+    async fn tls_connect_rejects_missing_identity_when_verifying() {
+        let config = TlsConnectorData::try_from(&TlsClientConfig::new()).unwrap();
+        let (stream, _) = tokio::io::duplex(64);
+        let error = tls_connect(rama_core::ServiceInput::new(stream), Some(config))
+            .await
+            .unwrap_err();
+        let TlsConnectError::Builder(error) = error else {
+            panic!("expected builder error");
+        };
+        assert_eq!(
+            error.to_string(),
+            "server identity required when server verification is enabled"
+        );
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn fallback_http_version_does_not_constrain_alpn() {
+        use rama_net::http::{FallbackHttpVersion, Version};
+
+        let extensions = Extensions::new();
+        extensions.insert(TlsAlpn::http_auto());
+        extensions.insert(FallbackHttpVersion(Version::HTTP_11));
+
+        resolve_http_alpn(&extensions, Some(&Protocol::HTTPS)).unwrap();
+        assert_eq!(
+            extensions.get_ref::<TlsAlpn>().map(|alpn| alpn.0.clone()),
+            Some(TlsAlpn::http_auto().0),
+        );
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn concrete_http_version_keeps_alps_coupled_to_forced_alpn() {
+        use crate::client::BoringAlps;
+
+        for (version, expected_alps) in [
+            (Version::HTTP_11, Vec::new()),
+            (Version::HTTP_2, vec![ApplicationProtocol::HTTP_2]),
+        ] {
+            let extensions = Extensions::new();
+            extensions.insert(TlsAlpn::http_auto());
+            extensions.insert(BoringAlps {
+                protocols: vec![ApplicationProtocol::HTTP_2],
+                new_codepoint: true,
+            });
+            extensions.insert(TargetHttpVersion(version));
+
+            resolve_http_alpn(&extensions, Some(&Protocol::HTTPS))
+                .expect("resolve concrete HTTP ALPN");
+
+            let expected_alpn = ApplicationProtocol::try_from(version).unwrap();
+            assert_eq!(
+                extensions
+                    .get_ref::<TlsAlpn>()
+                    .map(|alpn| alpn.0.as_slice()),
+                Some([expected_alpn].as_slice())
+            );
+            assert_eq!(
+                extensions
+                    .get_ref::<BoringAlps>()
+                    .map(|alps| (alps.protocols.as_slice(), alps.new_codepoint)),
+                Some((expected_alps.as_slice(), true))
+            );
+        }
+    }
+
+    #[test]
+    fn inherited_alpn_and_alps_are_preserved_for_any_application_protocol() {
+        use crate::client::BoringAlps;
+
+        let base = Extensions::new();
+        base.insert(TlsAlpn::http_auto());
+        base.insert(BoringAlps {
+            protocols: vec![ApplicationProtocol::HTTP_2],
+            new_codepoint: true,
+        });
+        let request = Extensions::new();
+        let effective = request.fork().with_base(&base);
+
+        apply_default_alpn(&effective, Some(&Protocol::ICAPS));
+
+        assert_eq!(
+            effective.get_ref::<TlsAlpn>().map(|alpn| alpn.0.as_slice()),
+            Some([ApplicationProtocol::HTTP_2, ApplicationProtocol::HTTP_11].as_slice()),
+        );
+        assert_eq!(
+            effective
+                .get_ref::<BoringAlps>()
+                .map(|alps| (alps.protocols.as_slice(), alps.new_codepoint)),
+            Some(([ApplicationProtocol::HTTP_2].as_slice(), true)),
+        );
+    }
+
+    #[test]
+    fn derives_empty_alpn_for_icaps_without_explicit_policy() {
+        let effective = Extensions::new();
+
+        apply_default_alpn(&effective, Some(&Protocol::ICAPS));
+
+        assert_eq!(
+            effective.get_ref::<TlsAlpn>().map(|alpn| alpn.0.as_slice()),
+            Some([].as_slice()),
+        );
+    }
+
+    #[test]
+    fn inherited_http_alpn_and_alps_survive_for_https() {
+        use crate::client::BoringAlps;
+
+        let base = Extensions::new();
+        base.insert(TlsAlpn::http_auto());
+        base.insert(BoringAlps {
+            protocols: vec![ApplicationProtocol::HTTP_2],
+            new_codepoint: true,
+        });
+        let request = Extensions::new();
+        let effective = request.fork().with_base(&base);
+
+        apply_default_alpn(&effective, Some(&Protocol::HTTPS));
+
+        assert_eq!(
+            effective.get_ref::<TlsAlpn>().map(|alpn| alpn.0.as_slice()),
+            Some([ApplicationProtocol::HTTP_2, ApplicationProtocol::HTTP_11].as_slice()),
+        );
+        assert_eq!(
+            effective
+                .get_ref::<BoringAlps>()
+                .map(|alps| (alps.protocols.as_slice(), alps.new_codepoint)),
+            Some(([ApplicationProtocol::HTTP_2].as_slice(), true)),
+        );
+    }
+
+    #[test]
+    fn inherited_http_alpn_suppresses_incompatible_alps() {
+        use crate::client::BoringAlps;
+
+        let base = Extensions::new();
+        base.insert(TlsAlpn::http_1());
+        base.insert(BoringAlps {
+            protocols: vec![ApplicationProtocol::HTTP_2],
+            new_codepoint: true,
+        });
+        let request = Extensions::new();
+        let effective = request.fork().with_base(&base);
+
+        apply_default_alpn(&effective, Some(&Protocol::HTTPS));
+
+        assert_eq!(
+            effective.get_ref::<TlsAlpn>().map(|alpn| alpn.0.as_slice()),
+            Some([ApplicationProtocol::HTTP_11].as_slice()),
+        );
+        assert_eq!(
+            effective
+                .get_ref::<BoringAlps>()
+                .map(|alps| (alps.protocols.as_slice(), alps.new_codepoint)),
+            Some(([].as_slice(), true)),
+        );
+    }
+
+    #[test]
+    fn request_alpn_overrides_base_and_recouples_alps() {
+        use crate::client::BoringAlps;
+
+        let base = Extensions::new();
+        base.insert(TlsAlpn::http_auto());
+        base.insert(BoringAlps {
+            protocols: vec![ApplicationProtocol::HTTP_2],
+            new_codepoint: true,
+        });
+        let request = Extensions::new();
+        request.insert(TlsAlpn::http_1());
+        let effective = request.with_base(&base);
+
+        apply_default_alpn(&effective, Some(&Protocol::HTTPS));
+
+        assert_eq!(
+            effective.get_ref::<TlsAlpn>().map(|alpn| alpn.0.as_slice()),
+            Some([ApplicationProtocol::HTTP_11].as_slice()),
+        );
+        assert_eq!(
+            effective
+                .get_ref::<BoringAlps>()
+                .map(|alps| alps.protocols.as_slice()),
+            Some([].as_slice()),
+        );
+    }
+
+    #[test]
+    fn inherited_alpn_survives_without_application_protocol() {
+        let base = Extensions::new();
+        base.insert(TlsAlpn::http_1());
+        let effective = Extensions::new().with_base(&base);
+
+        apply_default_alpn(&effective, None);
+
+        assert_eq!(
+            effective.get_ref::<TlsAlpn>().map(|alpn| alpn.0.as_slice()),
+            Some([ApplicationProtocol::HTTP_11].as_slice()),
+        );
+    }
+
+    #[cfg(feature = "http")]
+    #[test]
+    fn icaps_ignores_http_version_hint() {
+        let extensions = Extensions::new();
+        extensions.insert(TlsAlpn::empty());
+        extensions.insert(TargetHttpVersion(Version::HTTP_2));
+
+        resolve_http_alpn(&extensions, Some(&Protocol::ICAPS)).unwrap();
+
+        assert_eq!(
+            extensions
+                .get_ref::<TlsAlpn>()
+                .map(|alpn| alpn.0.as_slice()),
+            Some([].as_slice()),
+        );
     }
 }

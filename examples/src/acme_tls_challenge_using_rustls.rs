@@ -61,6 +61,7 @@ use rama::{
     graceful,
     http::{client::EasyHttpWebClient, server::HttpServer, service::web::response::IntoResponse},
     layer::ConsumeErrLayer,
+    net::tls::ApplicationProtocol,
     rt::Executor,
     service::service_fn,
     tcp::server::TcpListener,
@@ -70,7 +71,7 @@ use rama::{
         subscriber::{EnvFilter, fmt, layer::SubscriberExt, util::SubscriberInitExt},
     },
     tls::{
-        ApplicationProtocol, KeyLogIntent,
+        KeyLogIntent,
         client::{ServerVerifyMode, TlsClientConfig},
         server::{ServerAuthData, TlsServerConfig},
     },
@@ -118,6 +119,7 @@ async fn main() {
         .with_proxy_support()
         .with_tls_support_using_rustls(tls_config)
         .with_default_http_connector(Executor::graceful(graceful.guard()))
+        .without_connection_pool()
         .build_client()
         .boxed();
 

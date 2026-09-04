@@ -12,12 +12,10 @@ use crate::{
 
 use rama_core::{
     error::{BoxError, ErrorContext},
-    extensions::Extension,
     telemetry::tracing,
 };
 
-#[derive(Debug, Clone, PartialEq, Eq, Extension)]
-#[extension(tags(net, proxy))]
+#[derive(Debug, Clone, PartialEq, Eq)]
 /// Address of a proxy that can be connected to.
 pub struct ProxyAddress {
     /// [`Protocol`] used by the proxy.
@@ -51,8 +49,16 @@ impl TryFrom<&str> for ProxyAddress {
                 },
         } = Authority::try_from(slice)?;
 
-        let port = maybe_port.as_u16().or_else(|| protocol.as_ref().and_then(|protocol| protocol.default_port()))
-            .context("proxy address contains no port or scheme with known port; port is required for proxy connections!!")?;
+        let port = maybe_port
+            .as_u16()
+            .or_else(|| {
+                protocol
+                    .as_ref()
+                    .and_then(Protocol::proxy_default_port)
+            })
+            .context(
+                "proxy address contains no port or scheme with a known proxy port; port is required for proxy connections",
+            )?;
 
         Ok(Self {
             protocol,
@@ -276,11 +282,13 @@ mod tests {
     #[test]
     fn test_valid_proxy_address_symmetric() {
         for (s, expected) in [
-            ("http://proxy.io", Some("http://proxy.io:80")),
+            ("http://proxy.io", Some("http://proxy.io:1080")),
+            ("https://proxy.io", Some("https://proxy.io:443")),
+            ("socks5://proxy.io", Some("socks5://proxy.io:1080")),
+            ("socks5h://proxy.io", Some("socks5h://proxy.io:1080")),
             ("proxy.io:8080", None),
             ("127.0.0.1:8080", None),
             ("[::1]:8080", None),
-            ("socks5://proxy.io", Some("socks5://proxy.io:1080")),
             ("socks5://proxy.io:8080", None),
             ("socks5://127.0.0.1", Some("socks5://127.0.0.1:1080")),
             ("socks5://127.0.0.1:8080", None),

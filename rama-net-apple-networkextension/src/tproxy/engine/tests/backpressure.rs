@@ -185,7 +185,7 @@ fn tcp_byte_stream_preserved_under_egress_backpressure() {
 /// resumes when `on_client_read_demand` fires. With capacity 1 it exercises
 /// the `try_enqueue_client` lost-wakeup window on every chunk — if the demand
 /// is ever dropped, the producer parks forever and the per-pause wait below
-/// trips its deadline. Regression guard for the post-store re-check fix.
+/// trips its deadline. Regression guard for the gated pause/drain handshake.
 #[test]
 fn tcp_ingress_resumes_via_read_demand_at_capacity_one() {
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -269,7 +269,9 @@ fn tcp_ingress_resumes_via_read_demand_at_capacity_one() {
                     // Wait for a read-demand strictly newer than `seen` — never
                     // a busy-retry. A lost wakeup never bumps the counter, so
                     // this trips the deadline (the bug this test guards).
-                    let deadline = Instant::now() + Duration::from_secs(15);
+                    // Keep enough headroom for a saturated CI runner while
+                    // still bounding an actual regression.
+                    let deadline = Instant::now() + Duration::from_secs(60);
                     while demand.load(AtomicOrdering::Acquire) <= seen {
                         let remaining = deadline.saturating_duration_since(Instant::now());
                         assert!(

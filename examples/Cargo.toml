@@ -12,9 +12,9 @@ publish = false
 [package.metadata.cargo-public-api-crates]
 allowed = []
 
-# used by build.rs behind the `ttrpc` feature, which cargo-machete cannot see
+# used by build.rs behind the `grpc`/`ttrpc` features, which cargo-machete cannot see
 [package.metadata.cargo-machete]
-ignored = ["rama-ttrpc-build"]
+ignored = ["rama-grpc-build", "rama-ttrpc-build"]
 
 [[bin]]
 name = "acme_http_challenge"
@@ -37,9 +37,19 @@ path = "src/autobahn_client.rs"
 required-features = ["http-full"]
 
 [[bin]]
+name = "http_blocking_https_client"
+path = "src/http_blocking_https_client.rs"
+required-features = ["http-full", "boring"]
+
+[[bin]]
 name = "http_connect_proxy"
 path = "src/http_connect_proxy.rs"
 required-features = ["http-full"]
+
+[[bin]]
+name = "http_icap_proxy"
+path = "src/http_icap_proxy.rs"
+required-features = ["http-full", "icap", "boring"]
 
 [[bin]]
 name = "http_declarative_partial_updates"
@@ -122,6 +132,11 @@ path = "src/http_mitm_proxy_rustls.rs"
 # ensure to also enable at least one of following features: aws-lc, ring
 # in order to test this example we cannot add this to required features, sorry
 required-features = ["http-full", "rustls"]
+
+[[bin]]
+name = "http_pac_client"
+path = "src/http_pac_client.rs"
+required-features = ["pac"]
 
 [[bin]]
 name = "http_pooled_client"
@@ -229,6 +244,11 @@ path = "src/http_sse_datastar_hello.rs"
 required-features = ["http-full"]
 
 [[bin]]
+name = "http_sse_datastar_svg"
+path = "src/http_sse_datastar_svg.rs"
+required-features = ["http-full"]
+
+[[bin]]
 name = "http_sse_datastar_test_suite"
 path = "src/http_sse_datastar_test_suite.rs"
 required-features = ["http-full"]
@@ -267,6 +287,37 @@ required-features = ["http-full"]
 name = "tcp_listener_hello"
 path = "src/tcp_listener_hello.rs"
 required-features = ["tcp"]
+
+[[bin]]
+name = "grpc_echo_server"
+path = "src/grpc_echo/server.rs"
+required-features = ["grpc", "http-full"]
+
+[[bin]]
+name = "grpc_echo_client"
+path = "src/grpc_echo/client.rs"
+required-features = ["grpc", "http-full"]
+
+[[bin]]
+name = "http_grpc_job_server"
+path = "src/http_grpc_job/server.rs"
+required-features = ["grpc", "http-full"]
+
+# Shared by the two binaries: src/http_grpc_job/common.rs and src/http_grpc_job/jobs.rs.
+[[bin]]
+name = "http_grpc_job_client"
+path = "src/http_grpc_job/client.rs"
+required-features = ["grpc", "http-full"]
+
+[[bin]]
+name = "grpc_json_echo_server"
+path = "src/grpc_json_echo/server.rs"
+required-features = ["grpc", "http-full"]
+
+[[bin]]
+name = "grpc_json_echo_client"
+path = "src/grpc_json_echo/client.rs"
+required-features = ["grpc", "http-full"]
 
 [[bin]]
 name = "ttrpc_server"
@@ -424,6 +475,11 @@ path = "src/unix_datagram_codec.rs"
 required-features = ["unix"]
 
 [[bin]]
+name = "ws_blocking_wss_client"
+path = "src/ws_blocking_wss_client.rs"
+required-features = ["http-full", "boring"]
+
+[[bin]]
 name = "ws_echo_server"
 path = "src/ws_echo_server.rs"
 required-features = ["http-full"]
@@ -452,6 +508,7 @@ required-features = ["http-full", "boring"]
 # read the same as they did when these lived in the `rama` crate. `ttrpc` additionally
 # wires up protobuf codegen (see its comment below).
 [features]
+pac = ["rama/pac", "http-full"]
 default = []
 cli = ["rama/cli"]
 tcp = ["rama/tcp"]
@@ -459,6 +516,7 @@ udp = ["rama/udp"]
 dns = ["rama/dns"]
 unix = ["rama/unix"]
 http-full = ["rama/http-full", "dns", "compression"]
+icap = ["rama/icap"]
 tls = ["rama/tls"]
 boring = ["rama/boring"]
 rustls = ["rama/rustls"]
@@ -471,7 +529,7 @@ haproxy = ["rama/haproxy"]
 fastcgi = ["rama/fastcgi"]
 tower = ["rama/tower"]
 opentelemetry = ["rama/opentelemetry"]
-grpc = ["rama/grpc"]
+grpc = ["rama/grpc", "dep:rama-grpc-build"]
 ttrpc = ["rama/ttrpc", "dep:rama-ttrpc-build"]
 proxy-full = ["rama/proxy-full", "haproxy", "socks5"]
 net-apple-xpc = ["rama/net-apple-xpc"]
@@ -479,9 +537,7 @@ net-apple-xpc = ["rama/net-apple-xpc"]
 [dependencies]
 ahash = { workspace = true }
 base64 = { workspace = true }
-bytes = { workspace = true }
 clap = { workspace = true }
-futures = { workspace = true }
 indexmap = { workspace = true, features = ["serde"] }
 itertools = { workspace = true }
 itoa = { workspace = true }
@@ -495,6 +551,10 @@ serde_json = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 
 [build-dependencies]
+rama-grpc-build = { workspace = true, optional = true, features = [
+    "protobuf",
+    "vendor-protoc",
+] }
 rama-ttrpc-build = { workspace = true, optional = true, features = ["vendor-protoc"] }
 
 [dev-dependencies]

@@ -3,7 +3,7 @@ use rama::{
     http::layer::har::{self},
     http::service::web::response::Json,
     http::{BodyExtractExt, Request, StatusCode, server::HttpServer},
-    net::address::ProxyAddress,
+    net::{address::ProxyAddress, client::ProxyRoute},
     rt::Executor,
     service::service_fn,
 };
@@ -37,7 +37,7 @@ async fn test_http_record_har() {
     // test regular proxy flow w/o har recording enabled
     let response = runner
         .get("http://127.0.0.1:63007/fetch/1")
-        .extension(proxy_address.clone())
+        .extension(ProxyRoute::Proxy(proxy_address.clone()))
         .send()
         .await
         .unwrap();
@@ -51,7 +51,7 @@ async fn test_http_record_har() {
     // toggle har recording on
     let status_code = runner
         .post("http://har.toggle.internal/switch")
-        .extension(proxy_address.clone())
+        .extension(ProxyRoute::Proxy(proxy_address.clone()))
         .send()
         .await
         .unwrap()
@@ -62,7 +62,7 @@ async fn test_http_record_har() {
 
     let response = runner
         .get("http://127.0.0.1:63007/fetch/2")
-        .extension(proxy_address.clone())
+        .extension(ProxyRoute::Proxy(proxy_address.clone()))
         .send()
         .await
         .unwrap();
@@ -82,7 +82,7 @@ async fn test_http_record_har() {
 
     let response = runner
         .get("http://127.0.0.1:63007/fetch/3")
-        .extension(proxy_address.clone())
+        .extension(ProxyRoute::Proxy(proxy_address.clone()))
         .send()
         .await
         .unwrap();
@@ -102,7 +102,7 @@ async fn test_http_record_har() {
     // toggle recording off again
     let status_code = runner
         .post("http://har.toggle.internal/switch")
-        .extension(proxy_address.clone())
+        .extension(ProxyRoute::Proxy(proxy_address.clone()))
         .send()
         .await
         .unwrap()
@@ -112,7 +112,7 @@ async fn test_http_record_har() {
     // test regular proxy flow once again w/o har recording enabled
     let response = runner
         .get("http://127.0.0.1:63007/fetch/4")
-        .extension(proxy_address.clone())
+        .extension(ProxyRoute::Proxy(proxy_address.clone()))
         .send()
         .await
         .unwrap();
@@ -152,7 +152,7 @@ async fn test_http_record_har() {
     assert_eq!("GET", log.entries[0].request.method);
     assert_eq!("http://127.0.0.1:63007/fetch/2", log.entries[0].request.url);
     // ...... response
-    assert_eq!(200, log.entries[0].response.as_ref().unwrap().status);
+    assert_eq!(200, log.entries[0].response.status);
     // ... test entry #2
     // ...... not yet supported
     assert!(log.entries[1].comment.is_none());
@@ -164,5 +164,5 @@ async fn test_http_record_har() {
     assert_eq!("GET", log.entries[1].request.method);
     assert_eq!("http://127.0.0.1:63007/fetch/3", log.entries[1].request.url);
     // ...... response
-    assert_eq!(200, log.entries[1].response.as_ref().unwrap().status);
+    assert_eq!(200, log.entries[1].response.status);
 }

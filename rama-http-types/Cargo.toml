@@ -29,22 +29,22 @@ default = []
 tls = ["dep:rama-tls", "rama-tls/http"]
 
 [dependencies]
-bytes = { workspace = true }
+bytes = { workspace = true, features = ["std"] }
 const_format = { workspace = true }
 fnv = { workspace = true }
 futures-core = { workspace = true }
 hex = { workspace = true }
-itertools = { workspace = true }
+httparse = { workspace = true }
 itoa = { workspace = true }
 md5 = { workspace = true }
 memchr = { workspace = true }
 mime = { workspace = true }
 mime_guess = { workspace = true }
-nom = { workspace = true }
+parking_lot = { workspace = true }
 pin-project-lite = { workspace = true }
 rama-core = { workspace = true, features = ["std"] }
 rama-json = { workspace = true }
-rama-net = { workspace = true, features = ["std", "http"] }
+rama-net = { workspace = true, features = ["std"] }
 rama-tls = { workspace = true, optional = true }
 rama-utils = { workspace = true, features = ["std"] }
 rand = { workspace = true }
@@ -55,9 +55,9 @@ sync_wrapper = { workspace = true }
 tokio = { workspace = true, features = ["macros", "io-std", "sync"] }
 
 [dev-dependencies]
-futures-util = { workspace = true }
 quickcheck = { workspace = true }
 rand = { workspace = true }
+serde_test = { workspace = true }
 tokio = { workspace = true, features = ["full"] }
 
 [lints]

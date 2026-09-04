@@ -14,10 +14,16 @@ use rama_core::{
     telemetry::tracing,
 };
 use rama_crypto::pki_types::CertificateDer;
-use rama_net::address::{Domain, HostWithPort};
 use rama_net::extensions::StreamTransformed;
+use rama_net::{
+    address::{Domain, Host, HostWithPort},
+    client::ConnectorTarget,
+    tls::ApplicationProtocol,
+};
 use rama_tls::{
-    ApplicationProtocol, KeyLogIntent, client::NegotiatedTlsParameters, server::SelfSignedData,
+    KeyLogIntent,
+    client::{NegotiatedTlsParameters, TlsServerIdentity},
+    server::SelfSignedCaConfig,
 };
 use rama_utils::str::any_submatch_ignore_ascii_case;
 use std::{
@@ -39,6 +45,9 @@ pub mod issuer;
 
 pub mod revocation;
 
+mod egress;
+pub use self::egress::TlsMitmEgressServerAuth;
+
 mod service;
 pub use self::service::TlsMitmRelayService;
 
@@ -46,10 +55,20 @@ pub use self::service::TlsMitmRelayService;
 /// A utility that can be used by MITM services such as transparent proxies,
 /// in order to relay (and MITM a TLS connection between a client and server,
 /// as part of a deep protocol inspection protocol (DPI) flow.
+///
+/// With the `http` feature, a per-flow `TargetHttpVersion` is a best-effort
+/// preference. The relay narrows its upstream ALPN offer only when a peeked
+/// ingress ClientHello can negotiate the same protocol (or when HTTP/1.1 is
+/// its natural no-ALPN fallback). Otherwise the preference is ignored because
+/// this TLS relay does not translate HTTP versions and the intercepted client
+/// remains authoritative. Upstream negotiation may also decline the preferred
+/// protocol. Without an applicable preference, normal ClientHello mirroring
+/// and upstream negotiation decide the concrete HTTP version.
 pub struct TlsMitmRelay<Issuer> {
     issuer: Issuer,
     grease_enabled: bool,
     keylog_intent: KeyLogIntent,
+    egress_server_auth: Option<TlsMitmEgressServerAuth>,
 }
 
 impl<Issuer> TlsMitmRelay<Issuer> {
@@ -60,6 +79,7 @@ impl<Issuer> TlsMitmRelay<Issuer> {
             issuer,
             grease_enabled: true,
             keylog_intent: KeyLogIntent::Environment,
+            egress_server_auth: None,
         }
     }
 
@@ -100,6 +120,37 @@ impl<Issuer> TlsMitmRelay<Issuer> {
     pub fn keylog_intent_ref(&self) -> &KeyLogIntent {
         &self.keylog_intent
     }
+
+    rama_utils::macros::generate_set_and_with! {
+        /// Set the optional server-authentication policy for upstream TLS.
+        ///
+        /// This policy controls only upstream certificate and identity
+        /// verification. It cannot override the ClientHello fingerprint,
+        /// protocol negotiation, client authentication, or key logging.
+        ///
+        /// Upstream certificate verification is disabled by default, both with
+        /// no policy and for [`TlsMitmEgressServerAuth::default`]. This preserves
+        /// transparent relay behavior for certificates the intercepted client
+        /// may choose to accept. Select
+        /// [`rama_tls::client::ServerVerifyMode::Auto`] explicitly to enforce
+        /// upstream certificate and hostname verification.
+        ///
+        /// Direct [`Self::handshake`] calls apply this policy when their
+        /// `connector_data` argument is `None`. Explicit connector data is
+        /// authoritative because it is already a fully-resolved backend
+        /// configuration; [`TlsMitmRelayService`] supplies such data only after
+        /// applying this policy itself.
+        pub fn egress_server_auth(mut self, policy: Option<TlsMitmEgressServerAuth>) -> Self {
+            self.egress_server_auth = policy;
+            self
+        }
+    }
+
+    /// Borrow the configured upstream server-authentication policy, if any.
+    #[must_use]
+    pub fn egress_server_auth_ref(&self) -> Option<&TlsMitmEgressServerAuth> {
+        self.egress_server_auth.as_ref()
+    }
 }
 
 impl<Issuer> TlsMitmRelay<self::issuer::CachedBoringMitmCertIssuer<Issuer>> {
@@ -128,7 +179,7 @@ impl<Issuer> TlsMitmRelay<self::issuer::CachedBoringMitmCertIssuer<Issuer>> {
 impl TlsMitmRelay<self::issuer::InMemoryBoringMitmCertIssuer> {
     #[inline(always)]
     /// Create a new [`TlsMitmRelay`] with self-signed CA using the given data.
-    pub fn try_new_with_self_signed_issuer(data: &SelfSignedData) -> Result<Self, BoxError> {
+    pub fn try_new_with_self_signed_issuer(data: &SelfSignedCaConfig) -> Result<Self, BoxError> {
         let issuer = self::issuer::InMemoryBoringMitmCertIssuer::try_new_self_signed(data)?;
         Ok(Self::new(issuer))
     }
@@ -149,7 +200,9 @@ impl
     #[inline(always)]
     /// Create a new [`TlsMitmRelay`] with self-signed CA using the given data,
     /// with a cache layer on top to provide reuse functionality of previously issued certs.
-    pub fn try_new_with_cached_self_signed_issuer(data: &SelfSignedData) -> Result<Self, BoxError> {
+    pub fn try_new_with_cached_self_signed_issuer(
+        data: &SelfSignedCaConfig,
+    ) -> Result<Self, BoxError> {
         let issuer = self::issuer::InMemoryBoringMitmCertIssuer::try_new_self_signed(data)?;
         Ok(Self::new_with_cached_issuer(issuer))
     }
@@ -159,7 +212,7 @@ impl
     /// with a cache layer (created by given config)
     /// on top to provide reuse functionality of previously issued certs.
     pub fn try_new_with_cached_self_signed_issuer_and_config(
-        data: &SelfSignedData,
+        data: &SelfSignedCaConfig,
         cfg: self::issuer::BoringMitmCertIssuerCacheConfig,
     ) -> Result<Self, BoxError> {
         let issuer = self::issuer::InMemoryBoringMitmCertIssuer::try_new_self_signed(data)?;
@@ -480,27 +533,72 @@ fn reason_is_cert_trust_signal(reason: &str) -> bool {
     any_submatch_ignore_ascii_case(reason, CERT_TRUST_REASON_SUBSTRINGS)
 }
 
+/// Project a TLS server identity onto the DNS-only SNI namespace.
+///
+/// IP identities remain valid for certificate verification and pin scoping but
+/// must never be serialized as SNI.
+fn server_name_as_sni(server_name: &Host) -> Option<Domain> {
+    match TlsServerIdentity::try_from(server_name).ok()? {
+        TlsServerIdentity::Dns(domain) => Some(domain.into_owned()),
+        TlsServerIdentity::Ip(_) => None,
+    }
+}
+
 impl<Issuer> TlsMitmRelay<Issuer>
 where
     Issuer: self::issuer::BoringMitmCertIssuer<Error: Into<BoxError>>,
 {
-    /// Establish and MITM an handshake between the client (ingress) and server (egress).
+    /// Establish and MITM a handshake between the client (ingress) and server
+    /// (egress).
+    ///
+    /// When `connector_data` is `None`, the relay derives it from its key-log
+    /// intent and [`TlsMitmEgressServerAuth`]. With no authentication policy,
+    /// upstream verification remains disabled to preserve transparent relay
+    /// behavior. The direct handshake has no peeked ClientHello to mirror; it
+    /// can use a [`ConnectorTarget`] from the ingress extensions as a fallback
+    /// identity only when verification or pinning requires one.
+    ///
+    /// Explicit `connector_data` is authoritative. This is primarily used by
+    /// [`TlsMitmRelayService`], which has already combined the relay policy with
+    /// the peeked ClientHello and per-flow preferences.
     pub async fn handshake<Ingress, Egress>(
         &self,
-        BridgeIo(mut ingress_stream, egress_stream): BridgeIo<Ingress, Egress>,
+        input: BridgeIo<Ingress, Egress>,
         connector_data: Option<client::TlsConnectorData>,
     ) -> Result<BridgeIo<TlsStream<Ingress>, TlsStream<Egress>>, TlsMitmRelayError>
     where
         Ingress: Io + Unpin + extensions::ExtensionsRef,
         Egress: Io + Unpin + extensions::ExtensionsRef,
     {
-        let store_server_certificate_chain = connector_data
-            .as_ref()
-            .map(|cd| cd.store_server_certificate_chain)
-            .unwrap_or_default();
+        let connector_data = if let Some(data) = connector_data {
+            data
+        } else {
+            let server_auth = self.egress_server_auth_ref();
+            let connector_target = input
+                .extensions()
+                .get_ref::<ConnectorTarget>()
+                .map(|target| &target.0);
+            let server_name = self::egress::server_name(None, connector_target, server_auth);
+            let config = self::egress::tls_client_config(
+                None,
+                server_name,
+                self.keylog_intent_ref().clone(),
+                server_auth,
+            );
+            client::TlsConnectorData::try_from(&config).map_err(|error| {
+                TlsMitmRelayError::config(
+                    error.context("tls mitm relay: build direct egress connector data"),
+                )
+            })?
+        };
+        let BridgeIo(mut ingress_stream, egress_stream) = input;
+        let store_server_certificate_chain = connector_data.store_server_certificate_chain;
 
-        let egress_tls_stream = match crate::client::tls_connect(egress_stream, connector_data)
-            .await
+        let egress_tls_stream = match crate::client::tls_connect(
+            egress_stream,
+            Some(connector_data),
+        )
+        .await
         {
             Ok(stream) => stream,
             Err(err) => {
@@ -519,14 +617,14 @@ where
                                     "tls mitm relay: egress tls accept failed with io error: {io_err}"
                                 ))
                                 .context_debug_field("code", maybe_ssl_code)
-                                .context_debug_field("sni", server_name),
+                                .context_debug_field("server_identity", server_name),
                             )
                         } else if let Some(err) = error.as_ssl_error_stack() {
                             let mut relay_err = TlsMitmRelayError::handshake_ssl(
                                 TlsMitmRelayErrorDirection::Egress,
                                 err,
                             );
-                            relay_err.sni = server_name;
+                            relay_err.sni = server_name.as_ref().and_then(server_name_as_sni);
                             relay_err
                         } else {
                             TlsMitmRelayError::handshake(
@@ -535,7 +633,7 @@ where
                                     "tls mitm relay: egress tls accept failed",
                                 )
                                 .context_debug_field("code", maybe_ssl_code)
-                                .context_debug_field("sni", server_name),
+                                .context_debug_field("server_identity", server_name),
                                 maybe_ssl_code,
                             )
                         }
@@ -813,6 +911,35 @@ where
                 }
             })?;
 
+        let ingress_negotiated_params = {
+            let ssl = ingress_boring_ssl_stream.ssl();
+            let session = ssl.session().ok_or_else(|| {
+                TlsMitmRelayError::config(BoxError::from_static_str(
+                    "tls mitm relay: ingress tls stream has no session",
+                ))
+            })?;
+            let protocol_version =
+                session
+                    .protocol_version()
+                    .rama_try_into()
+                    .map_err(|version| {
+                        TlsMitmRelayError::config(
+                            BoxError::from_static_str(
+                                "tls mitm relay: cast ingress protocol version",
+                            )
+                            .context_field("protocol_version", version),
+                        )
+                    })?;
+            NegotiatedTlsParameters {
+                protocol_version,
+                application_layer_protocol: ssl
+                    .selected_alpn_protocol()
+                    .map(ApplicationProtocol::from),
+                // This relay does not request a downstream client certificate.
+                // Never mislabel the upstream server chain as a client chain.
+                peer_certificate_chain: None,
+            }
+        };
         if let Some(negotiated_params) = maybe_negotiated_params {
             #[cfg(feature = "http")]
             if let Some(proto) = negotiated_params.application_layer_protocol.as_ref()
@@ -827,6 +954,9 @@ where
         }
 
         let ingress_tls_stream = TlsStream::new(ingress_boring_ssl_stream);
+        ingress_tls_stream
+            .extensions()
+            .insert(ingress_negotiated_params);
         ingress_tls_stream.extensions().insert(StreamTransformed {
             by: "rama-tls-boring::TlsMitmRelay",
         });

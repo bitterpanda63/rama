@@ -2,6 +2,7 @@ use std::{borrow::Cow, error::Error, fmt, sync::Arc};
 
 use base64::Engine as _;
 use rama_core::{error::BoxError, extensions::Extension, telemetry::tracing};
+use rama_http::headers::{ContentType, HeaderMapExt as _};
 use rama_utils::str::arcstr::ArcStr;
 
 use ::{
@@ -17,7 +18,6 @@ use ::{
     rama_net::uri::util::percent_encoding::{AsciiSet, CONTROLS, percent_decode, percent_encode},
 };
 
-use crate::metadata::GRPC_CONTENT_TYPE;
 use crate::metadata::MetadataMap;
 
 const ENCODING_SET: &AsciiSet = &CONTROLS
@@ -328,7 +328,12 @@ impl Status {
         Self::new(Code::Unauthenticated, message)
     }
 
-    pub(crate) fn from_error_generic(err: impl Into<BoxError>) -> Self {
+    /// Create a `Status` from any error which can be boxed.
+    ///
+    /// This is the same as [`Self::from_error`], but without having to box the error yourself.
+    /// It is what codecs are expected to use to turn an encoding error into a `Status`,
+    /// see [`crate::codec::Encoder::encode`].
+    pub fn from_error_generic(err: impl Into<BoxError>) -> Self {
         Self::from_error(err.into())
     }
 
@@ -619,9 +624,7 @@ impl Status {
     /// Build an `http::Response` from the given `Status`.
     pub fn try_into_http<B: Default>(self) -> Result<rama_http_types::Response<B>, Self> {
         let mut response = rama_http_types::Response::new(B::default());
-        response
-            .headers_mut()
-            .insert(rama_http_types::header::CONTENT_TYPE, GRPC_CONTENT_TYPE);
+        response.headers_mut().typed_insert(ContentType::grpc());
         self.add_header(response.headers_mut())?;
         response.extensions().insert(self);
         Ok(response)

@@ -31,6 +31,10 @@ extern crate alloc;
 
 pub mod extensions;
 
+mod fork;
+#[doc(inline)]
+pub use fork::Fork;
+
 #[doc(inline)]
 pub use ::rama_error as error;
 
@@ -44,7 +48,7 @@ pub mod graceful;
 pub mod rt;
 
 pub mod service;
-pub use service::Service;
+pub use service::{BlockingService, Service};
 
 pub mod layer;
 pub use layer::Layer;

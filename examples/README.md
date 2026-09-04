@@ -30,7 +30,7 @@ You can find these integration tests at [./tests/integration](./tests/integratio
 - [`http_health_check.rs`](./src/http_health_check.rs) - Health check endpoint implementation
 - [`http_har_replay.rs`](./src/http_har_replay.rs): HAR replay demonstration
 - [`http_k8s_health.rs`](./src/http_k8s_health.rs) - Kubernetes health check implementation
-- [`http_record_har.rs`](./src/http_record_har.rs) - Demo of HAR HTTP layer provided by rama
+- [`http_record_har.rs`](./src/http_record_har.rs) - HAR recording on a Relay/Peek MITM proxy
 - [`http_octet_stream.rs`](./src/http_octet_stream.rs) - Binary data responses with file downloads
 - [`http_multipart.rs`](./src/http_multipart.rs) - `multipart/form-data` upload handling
 - [`http_advanced_router.rs`](./src/http_advanced_router.rs) - Advanced http router composition examples
@@ -44,7 +44,13 @@ You can find these integration tests at [./tests/integration](./tests/integratio
 
 ### gRPC
 
-See [the gRPC examples README at ./grpc/README.md](./grpc/README.md).
+The same `Echo` service, twice, so you can compare both flows:
+
+- [`grpc_echo/server.rs`](./src/grpc_echo/server.rs) + [`grpc_echo/client.rs`](./src/grpc_echo/client.rs) - the classic flow: a [`.proto` contract](./proto/echo.proto) compiled into protobuf stubs by the build script, included by [`grpc_echo/echo.rs`](./src/grpc_echo/echo.rs)
+- [`grpc_json_echo/server.rs`](./src/grpc_json_echo/server.rs) + [`grpc_json_echo/client.rs`](./src/grpc_json_echo/client.rs) - the same service [defined inline in Rust](./src/grpc_json_echo/echo.rs) with messages serialized by serde (no `.proto` file, no build script). JSON is used because you can read it on the wire; any serde format works, and most are a better choice
+- [`http_grpc_job/server.rs`](./src/http_grpc_job/server.rs) + [`http_grpc_job/client.rs`](./src/http_grpc_job/client.rs) - a production-shaped job service where generated gRPC job and health services share one web router, listener and application state with operator-facing HTTP endpoints, plus a CLI for exploring both protocols; [`common.rs`](./src/http_grpc_job/common.rs) shares the typed HTTP contract and routes, while [`jobs.rs`](./src/http_grpc_job/jobs.rs) includes the generated protobuf API
+
+See also [the gRPC examples README at ./grpc/README.md](./grpc/README.md) for the protobuf-based examples.
 
 ### ttRPC
 - [`ttrpc_server.rs`](./src/ttrpc_server.rs) - Serve a ttRPC service (containerd-style RPC, no HTTP/2) over a rama-tcp connection
@@ -61,6 +67,7 @@ See [the gRPC examples README at ./grpc/README.md](./grpc/README.md).
 - [`http_sse`](./src/http_sse.rs) - simple example demonstrating how one can expose an SSE endpoint
 - [`http_sse_json`](./src/http_sse_json.rs) - same as `http_sse` but using structured _json_ data
 - [`http_sse_datastar_hello`](./src/http_sse_datastar_hello.rs) - a hello world example for datastar (featuring DIY `CQRS` in action);
+- [`http_sse_datastar_svg`](./src/http_sse_datastar_svg.rs) - server-rendered SVG updates using Datastar namespaces
 - [`http_sse_datastar_test_suite`](./src/http_sse_datastar_test_suite.rs) - datastar sdk test suite server
 
 Rama supports also client-side SSE. See the tests of these examples
@@ -78,10 +85,12 @@ side looks like.
 - [`http_anti_bot_zip_bomb.rs`](./src/http_anti_bot_zip_bomb.rs) - example demonstrating how to serve a zip bomb
 
 ## HTTP Clients
+- [`http_blocking_https_client.rs`](./src/http_blocking_https_client.rs) - Blocking HTTPS client with its own runtime thread
 - [`http_high_level_client.rs`](./src/http_high_level_client.rs) - High-level HTTP client implementation
 - [`http_pooled_client.rs`](./src/http_pooled_client.rs) - Connection pooling client
 
 ### WebSocket
+- [`ws_blocking_wss_client.rs`](./src/ws_blocking_wss_client.rs) - Blocking secure WebSocket client
 - [`ws_echo_server.rs`](./src/ws_echo_server.rs) - WebSocket server which echos all messages back
 - [`ws_echo_server_with_compression.rs`](./src/ws_echo_server_with_compression.rs) - WebSocket server which echos all messages back, with per message deflate compression enabled and supported
 - [`ws_chat_server.rs`](./src/ws_chat_server.rs) - WebSocket chat server
@@ -100,10 +109,11 @@ The following examples show how you can integrate ACME into you webservices (ACM
 ### Http Proxies
 
 - [`http_connect_proxy.rs`](./src/http_connect_proxy.rs) - HTTP CONNECT proxy implementation
-- [`http_mitm_proxy_rustls.rs`](./src/http_mitm_proxy_rustls.rs) - MITM proxy using Rustls
-- [`http_mitm_proxy_boring.rs`](./src/http_mitm_proxy_boring.rs) - MITM proxy using BoringSSL
-- [`http_mitm_relay_proxy_boring.rs`](./src/http_mitm_relay_proxy_boring.rs) - MITM proxy using BoringSSL with a more advanced relay approach
+- [`http_icap_proxy.rs`](./src/http_icap_proxy.rs) - HTTP(S) MITM proxy with embedded or external ICAP response adaptation
+- [`http_mitm_proxy_boring.rs`](./src/http_mitm_proxy_boring.rs) - recommended BoringSSL Relay/Peek MITM starting point with WebSocket and decoded-body inspection
+- [`http_mitm_relay_proxy_boring.rs`](./src/http_mitm_relay_proxy_boring.rs) - Relay/Peek example focused on user-agent request emulation and final egress-header inspection
 - [`mitm_ocsp_relay_gate.rs`](./src/mitm_ocsp_relay_gate.rs) - harness for the MITM OCSP-stapling gate (curl/openssl validate stapled leaves through the relay)
+- [`http_mitm_proxy_rustls.rs`](./src/http_mitm_proxy_rustls.rs) - Rustls compatibility example using manual ingress termination and deferred egress because a paired Rustls TLS relay is not yet available; its CONNECT success does not prove egress reachability
 
 ### Http within TLS Proxies
 
@@ -113,7 +123,7 @@ The following examples show how you can integrate ACME into you webservices (ACM
 
 - [`socks5_connect_proxy.rs`](./src/socks5_connect_proxy.rs) - SOCKS5 CONNECT proxy implementation
 - [`socks5_connect_proxy_mitm_proxy.rs`](./src/socks5_connect_proxy_mitm_proxy.rs) -
-  SOCKS5 CONNECT proxy implementation with HTTP(S) MITM Capabilities
+  SOCKS5 CONNECT proxy with HTTP(S) Relay/Peek MITM capabilities
 - [`socks5_connect_proxy_over_tls.rs`](./src/socks5_connect_proxy_over_tls.rs) -
   SOCKS5 CONNECT proxy implementation showing how to run it within a TLS tunnel w/ self-contained socks5 client
 - [`socks5_bind_proxy.rs`](./src/socks5_bind_proxy.rs) -
@@ -123,6 +133,12 @@ The following examples show how you can integrate ACME into you webservices (ACM
 - [`socks5_udp_associate_framed.rs`](./src/socks5_udp_associate_framed.rs) -
   Same as `socks5_udp_associate.rs` but demonstrating how to combine it with frames
 
+### Proxy Clients:
+
+- [`http_pac_client.rs`](./src/http_pac_client.rs) -
+  client routing its requests through the proxies a PAC script selects,
+  including how to generate that script from typed routing rules.
+
 ### Combo Proxies:
 
 - [`socks5_and_http_proxy.rs`](./src/socks5_and_http_proxy.rs) -
@@ -130,7 +146,7 @@ The following examples show how you can integrate ACME into you webservices (ACM
 - [`http_https_socks5_and_socks5h_connect_proxy.rs`](./src/http_https_socks5_and_socks5h_connect_proxy.rs) -
   combines `http_connect_proxy`, `https_connect_proxy` and `socks5_connect_proxy` into a single server.
 - [`proxy_connectivity_check.rs`](./src/proxy_connectivity_check.rs) -
-  combines an http and socks5 proxy, but mostly is about how you can add a connectivity check,
+  combines HTTP and SOCKS5 proxies using a protocol-peek relay to add a connectivity check,
   used by humans as a sanity check for whether or not they are connected (via) "the" proxy.
 
 ### Transparent Proxies
