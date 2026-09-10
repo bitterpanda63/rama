@@ -1,7 +1,7 @@
 use std::{convert::Infallible, sync::Arc};
 
 use rama_core::{
-    extensions::{Extension, ExtensionsRef},
+    extensions::{Extension, ExtensionsRef, Ingress},
     matcher::service::{ServiceMatch, ServiceMatcher},
     rt::Executor,
     telemetry::tracing,
@@ -158,11 +158,7 @@ where
         }
 
         if *store_handshake_req_header {
-            let head = svc_match.input.clone_parts();
-            svc_match
-                .input
-                .extensions()
-                .insert(HttpWebSocketRelayHandshakeRequest(head.into()));
+            store_handshake_request(&svc_match.input);
         }
 
         svc_match.service = Some(HttpWebSocketRelayServiceResponseMatcher {
@@ -195,11 +191,7 @@ where
         }
 
         if store_handshake_req_header {
-            let head = svc_match.input.clone_parts();
-            svc_match
-                .input
-                .extensions()
-                .insert(HttpWebSocketRelayHandshakeRequest(head.into()));
+            store_handshake_request(&svc_match.input);
         }
 
         svc_match.service = Some(HttpWebSocketRelayServiceResponseMatcher {
@@ -210,6 +202,21 @@ where
 
         Ok(svc_match)
     }
+}
+
+/// Store the handshake head on the ingress io store, where the relay can reach it.
+///
+/// The request's own extensions are not an option: an upgrade drops them
+/// (`Upgraded::new` forks the io store, and `handle_upgrade` copies no message
+/// extensions), so a relay would never see a head stored there.
+fn store_handshake_request<Body>(req: &Request<Body>) {
+    let Some(Ingress(ingress)) = req.extensions().ingress() else {
+        tracing::debug!(
+            "ws relay: handshake request not stored: no ingress wrapper on the request"
+        );
+        return;
+    };
+    ingress.insert(HttpWebSocketRelayHandshakeRequest(req.clone_parts().into()));
 }
 
 #[derive(Debug, Clone)]
@@ -337,6 +344,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rama_core::extensions::Extensions;
     use rama_http::{
         Body, Method, Request, Response,
         headers::{self, HeaderMapExt as _},
@@ -372,6 +380,38 @@ mod tests {
             StatusCode::SWITCHING_PROTOCOLS
         };
         response
+    }
+
+    fn websocket_request_with_ingress(io_extensions: &Extensions) -> Request {
+        let request = websocket_request(Version::HTTP_11);
+        request.extensions().insert(Ingress(io_extensions.clone()));
+        request
+    }
+
+    #[tokio::test]
+    async fn stored_handshake_request_lands_on_the_ingress_io_store() {
+        let matcher = HttpWebSocketRelayServiceRequestMatcher::new(())
+            .with_store_handshake_request_header(true);
+
+        let borrowed_io = Extensions::new();
+        matcher
+            .match_service(websocket_request_with_ingress(&borrowed_io))
+            .await
+            .expect("borrowed request match");
+
+        let owned_io = Extensions::new();
+        matcher
+            .into_match_service(websocket_request_with_ingress(&owned_io))
+            .await
+            .expect("owned request match");
+
+        for (io, label) in [(borrowed_io, "borrowed"), (owned_io, "owned")] {
+            assert!(
+                io.self_get_ref::<HttpWebSocketRelayHandshakeRequest>()
+                    .is_some(),
+                "{label} matcher must store the head on the io the upgraded stream forks from"
+            );
+        }
     }
 
     #[tokio::test]
