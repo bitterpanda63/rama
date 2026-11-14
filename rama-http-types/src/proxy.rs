@@ -35,32 +35,6 @@ impl PlaintextHttpProxyMode {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::PlaintextHttpProxyMode;
-    use rama_net::Protocol;
-
-    #[test]
-    fn plaintext_forwarding_requires_a_known_plaintext_http_protocol() {
-        for (protocol, forward) in [
-            (None, false),
-            (Some(Protocol::HTTP), true),
-            (Some(Protocol::WS), true),
-            (Some(Protocol::HTTPS), false),
-            (Some(Protocol::WSS), false),
-            (Some(Protocol::SOCKS5), false),
-            (Some("custom".parse().unwrap()), false),
-        ] {
-            assert_eq!(
-                PlaintextHttpProxyMode::Forward.should_forward(protocol.as_ref()),
-                forward,
-                "application protocol: {protocol:?}"
-            );
-            assert!(!PlaintextHttpProxyMode::Tunnel.should_forward(protocol.as_ref()));
-        }
-    }
-}
-
 /// Returns true if the provided reuqest is a HTTP Proxy Connect request.
 pub fn is_req_http_proxy_connect<Body>(req: &Request<Body>) -> bool {
     let http_version = req.version();
@@ -91,5 +65,31 @@ impl<Body> Matcher<Request<Body>> for HttpProxyConnectMatcher {
     #[inline(always)]
     fn matches(&self, _ext: Option<&Extensions>, req: &Request<Body>) -> bool {
         is_req_http_proxy_connect(req)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PlaintextHttpProxyMode;
+    use rama_net::Protocol;
+
+    #[test]
+    fn plaintext_forwarding_requires_a_known_plaintext_http_protocol() {
+        for (protocol, forward) in [
+            (None, false),
+            (Some(Protocol::HTTP), true),
+            (Some(Protocol::WS), true),
+            (Some(Protocol::HTTPS), false),
+            (Some(Protocol::WSS), false),
+            (Some(Protocol::SOCKS5), false),
+            (Some("custom".parse().unwrap()), false),
+        ] {
+            assert_eq!(
+                PlaintextHttpProxyMode::Forward.should_forward(protocol.as_ref()),
+                forward,
+                "application protocol: {protocol:?}"
+            );
+            assert!(!PlaintextHttpProxyMode::Tunnel.should_forward(protocol.as_ref()));
+        }
     }
 }
